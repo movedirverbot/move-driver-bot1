@@ -1,5 +1,5 @@
 {
-  "name": "move-driver-whatsapp-bot",
+  "name": "move-driver-bot1",
   "version": "1.0.0",
   "description": "Bot da Move Driver para integrar WhatsApp com API externa",
   "main": "index.js",
