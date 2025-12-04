@@ -351,7 +351,7 @@ async function criarSolicitacaoViagem(dadosCorrida) {
       const resultado = data.Resultado.resultado || {};
       return {
         solicitacaoId: resultado.SolicitacaoID,
-        dataHoraCriacao: resultado.DataHoraCriacao
+        dataHoraCriacao: resultado.DataHoraCriacao || null
       };
     }
 
@@ -361,7 +361,7 @@ async function criarSolicitacaoViagem(dadosCorrida) {
 
     return {
       solicitacaoId: data.SolicitacaoID || 0,
-      dataHoraCriacao: data.DataHoraCriicao || null
+      dataHoraCriacao: data.DataHoraCriacao || null
     };
   } catch (error) {
     if (error.response) {
@@ -477,10 +477,96 @@ async function cancelarSolicitacao(solicitacaoId, tipo = 'C', cancEngano = false
   }
 }
 
+// -----------------------------
+// Radar de Saturação (sem motoristas / aceite lento)
+// -----------------------------
+const SATURATION_CONFIG = {
+  noDriverWindowMs: 10 * 60 * 1000,       // janela 10 min
+  noDriverThreshold: 3,                   // 3 corridas sem motorista na janela
+  slowAcceptWindowMs: 15 * 60 * 1000,     // janela 15 min
+  slowAcceptThreshold: 5,                 // 5 aceitações lentas na janela
+  slowAcceptMinutes: 4,                   // "aceite lento" = > 4 minutos
+  minAlertIntervalMs: 10 * 60 * 1000      // mínimo 10 min entre alertas
+};
+
+const saturationState = {
+  noDriverEvents: [],   // array de timestamps (ms)
+  slowAcceptEvents: [], // array de timestamps (ms)
+  lastAlertAt: 0
+};
+
+function pruneOldEvents(arr, windowMs) {
+  const cutoff = Date.now() - windowMs;
+  return arr.filter(ts => ts >= cutoff);
+}
+
+async function checkAndAlertSaturation(whatsappFrom) {
+  const now = Date.now();
+  if (now - saturationState.lastAlertAt < SATURATION_CONFIG.minAlertIntervalMs) {
+    return; // evita spam
+  }
+
+  // Checa condições
+  const noDriverCount = saturationState.noDriverEvents.length;
+  const slowAcceptCount = saturationState.slowAcceptEvents.length;
+
+  let alertMessage = '';
+
+  if (noDriverCount >= SATURATION_CONFIG.noDriverThreshold) {
+    alertMessage +=
+      `⚠️ Detectamos várias corridas recentes sem motorista encontrado (últimos ${SATURATION_CONFIG.noDriverWindowMs / 60000} minutos).\n` +
+      `Pode estar faltando carros online.\n\n`;
+  }
+
+  if (slowAcceptCount >= SATURATION_CONFIG.slowAcceptThreshold) {
+    alertMessage +=
+      `⚠️ As últimas corridas estão demorando mais de ${SATURATION_CONFIG.slowAcceptMinutes} minutos para encontrar motorista com frequência.\n` +
+      `A demanda pode estar alta ou com poucos carros disponíveis.\n\n`;
+  }
+
+  if (alertMessage) {
+    alertMessage +=
+      `Sugestão: verifique o painel e, se necessário, chame mais motoristas no grupo.`;
+
+    await enviarMensagemWhatsApp(whatsappFrom, alertMessage);
+    saturationState.lastAlertAt = now;
+  }
+}
+
+async function registerNoDriverEvent(whatsappFrom) {
+  saturationState.noDriverEvents.push(Date.now());
+  saturationState.noDriverEvents = pruneOldEvents(
+    saturationState.noDriverEvents,
+    SATURATION_CONFIG.noDriverWindowMs
+  );
+
+  await checkAndAlertSaturation(whatsappFrom);
+}
+
+async function registerSlowAcceptEvent(whatsappFrom) {
+  saturationState.slowAcceptEvents.push(Date.now());
+  saturationState.slowAcceptEvents = pruneOldEvents(
+    saturationState.slowAcceptEvents,
+    SATURATION_CONFIG.slowAcceptWindowMs
+  );
+
+  await checkAndAlertSaturation(whatsappFrom);
+}
+
 // -----------------------------------------
 // Monitorar EtapaSolicitacao (DevBase)
 // -----------------------------------------
-function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, podeDuplicar = true) {
+//
+// dataHoraCriacaoMs: timestamp em ms (Date.now() ou Date.parse(...))
+// usado para medir quanto tempo demorou até alguém aceitar a corrida.
+//
+function startMonitoringSolicitacao(
+  solicitacaoId,
+  whatsappFrom,
+  dadosCorrida,
+  podeDuplicar = true,
+  dataHoraCriacaoMs = null
+) {
   const intervaloMs = 20000;     // 20s
   const maxMinutos = 360;        // ~6 horas
   const maxTentativas = Math.ceil((maxMinutos * 60 * 1000) / intervaloMs);
@@ -497,6 +583,8 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
   let sentEmViagem = false;
 
   let lastStatusLower = ''; // para detectar mudança de status
+
+  const createdAtMs = dataHoraCriacaoMs || Date.now();
 
   console.log(`Iniciando monitoramento da solicitação ${solicitacaoId} para ${whatsappFrom}`);
 
@@ -568,6 +656,12 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
         hasDriver = true;
         if (!driverAcceptedAt) {
           driverAcceptedAt = Date.now();
+
+          // mede quanto tempo demorou para aceitar
+          const diffMin = (driverAcceptedAt - createdAtMs) / 60000;
+          if (diffMin > SATURATION_CONFIG.slowAcceptMinutes) {
+            await registerSlowAcceptEvent(whatsappFrom);
+          }
         }
 
         if (!sentDriverInfo) {
@@ -631,6 +725,9 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
           try {
             const novoResultado = await criarSolicitacaoViagem(dadosCorrida);
             const novaSolicitacaoId = novoResultado.solicitacaoId;
+            const novaCriacaoMs = novoResultado.dataHoraCriacao
+              ? Date.parse(novoResultado.dataHoraCriacao)
+              : Date.now();
 
             await enviarMensagemWhatsApp(
               whatsappFrom,
@@ -641,7 +738,13 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
             );
 
             // Passa a monitorar a nova solicitação (sem duplicar de novo)
-            startMonitoringSolicitacao(novaSolicitacaoId, whatsappFrom, dadosCorrida, false);
+            startMonitoringSolicitacao(
+              novaSolicitacaoId,
+              whatsappFrom,
+              dadosCorrida,
+              false,
+              novaCriacaoMs
+            );
           } catch (erroReplica) {
             await enviarMensagemWhatsApp(
               whatsappFrom,
@@ -656,7 +759,7 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
         }
 
         if (!sentNoDriver && !podeDuplicar) {
-          // Segunda tentativa: não duplica mais
+          // Segunda tentativa: não duplica mais -> conta como evento de "sem motorista"
           const msg =
             `⚠️ Nenhum motorista foi encontrado novamente para a solicitação ${solicitacaoId}.\n` +
             `Status: ${StatusSolicitacao}\n\n` +
@@ -664,7 +767,10 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
             `Destino: ${destinoTexto}\n\n` +
             `Verifique no painel se deseja tentar mais uma vez ou encaminhar de outra forma.`;
           await enviarMensagemWhatsApp(whatsappFrom, msg);
+
           sentNoDriver = true;
+          await registerNoDriverEvent(whatsappFrom);
+
           clearInterval(interval);
           return;
         }
@@ -871,6 +977,9 @@ app.post('/webhook', async (req, res) => {
 
               const resultado = await criarSolicitacaoViagem(dados);
               const solicitacaoId = resultado.solicitacaoId;
+              const criacaoMs = resultado.dataHoraCriacao
+                ? Date.parse(resultado.dataHoraCriacao)
+                : Date.now();
 
               let textoValor = '';
               if (typeof dados.valor === 'number' && !isNaN(dados.valor)) {
@@ -900,8 +1009,14 @@ app.post('/webhook', async (req, res) => {
                   textoBotaoCriacao
                 );
 
-                // Inicia monitoramento dessa solicitação
-                startMonitoringSolicitacao(solicitacaoId, from, dados, true);
+                // Inicia monitoramento dessa solicitação (com timestamp de criação)
+                startMonitoringSolicitacao(
+                  solicitacaoId,
+                  from,
+                  dados,
+                  true,
+                  criacaoMs
+                );
               }
             } catch (erroApi) {
               await enviarMensagemWhatsApp(
