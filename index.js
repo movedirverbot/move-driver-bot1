@@ -17,7 +17,7 @@ const MOVEDRIVER_API_URL = process.env.MOVEDRIVER_API_URL;
 // Ex: Basic SEU_BASE64_DE_USUARIO:SENHA
 const MOVEDRIVER_BASIC_AUTH = process.env.MOVEDRIVER_BASIC_AUTH;
 
-// Base da API externa (usada para EtapaSolicitacao)
+// Base da API externa (usada para EtapaSolicitacao e CancelarSolicitacao)
 const MOVEDRIVER_BASE_URL =
   process.env.MOVEDRIVER_BASE_URL ||
   'https://webapiexterna.azurewebsites.net/movedriver/api/external/';
@@ -61,7 +61,7 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// Enviar mensagem pelo WhatsApp API
+// Enviar mensagem texto pelo WhatsApp API
 async function enviarMensagemWhatsApp(numero, texto) {
   try {
     const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
@@ -95,11 +95,66 @@ async function enviarMensagemWhatsApp(numero, texto) {
   }
 }
 
+// Enviar mensagem com botão de cancelar solicitação
+async function enviarMensagemWhatsAppComBotaoCancelar(numero, solicitacaoId, dadosCorrida) {
+  try {
+    const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
+
+    const bodyText =
+      `Solicitação ${solicitacaoId} criada.\n` +
+      `Origem: ${dadosCorrida.origem}\n` +
+      `Destino: ${dadosCorrida.destino}\n\n` +
+      `Se precisar, toque no botão abaixo para cancelar apenas essa solicitação.`;
+
+    await axios.post(
+      url,
+      {
+        messaging_product: 'whatsapp',
+        to: numero,
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: {
+            text: bodyText
+          },
+          action: {
+            buttons: [
+              {
+                type: 'reply',
+                reply: {
+                  // IMPORTANTÍSSIMO: id único com o número da solicitação
+                  id: `cancel_${solicitacaoId}`,
+                  title: 'Cancelar solicitação'
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    console.log('Mensagem com botão enviada para:', numero);
+  } catch (error) {
+    console.error('Erro ao enviar mensagem com botão:');
+    if (error.response) {
+      console.error(JSON.stringify(error.response.data, null, 2));
+    } else {
+      console.error(error.message);
+    }
+  }
+}
+
 // -------------------------
 // Parse do comando /corrida
 // -------------------------
 
-// Novo parser simples com " x " e valor opcional
+// Parser simples com " x " e valor opcional
 function parseCorridaSimples(texto) {
   if (!texto) return null;
 
@@ -342,27 +397,97 @@ async function criarSolicitacaoViagem(dadosCorrida) {
   }
 }
 
+// -----------------------------
+// Cancelar Solicitação na DevBase
+// -----------------------------
+async function cancelarSolicitacao(solicitacaoId, tipo = 'C', cancEngano = false, cliNaoEncontrado = false) {
+  if (!MOVEDRIVER_BASE_URL) {
+    throw new Error('MOVEDRIVER_BASE_URL não configurada.');
+  }
+  if (!MOVEDRIVER_BASIC_AUTH) {
+    throw new Error('MOVEDRIVER_BASIC_AUTH não configurada.');
+  }
+
+  if (!solicitacaoId) {
+    throw new Error('SolicitacaoID inválido para cancelamento.');
+  }
+
+  // tipo = "C" (cliente) ou "P" (prestador)
+  const url = `${MOVEDRIVER_BASE_URL}CancelarSolicitacao` +
+    `?solicitacaoID=${encodeURIComponent(solicitacaoId)}` +
+    `&tipo=${encodeURIComponent(tipo)}` +
+    `&cancEngano=${cancEngano}` +
+    `&cliNaoEncontrado=${cliNaoEncontrado}`;
+
+  console.log('Cancelando solicitação na API Move Driver:', url);
+
+  try {
+    const resp = await axios.post(
+      url,
+      {},
+      {
+        headers: {
+          Authorization: MOVEDRIVER_BASIC_AUTH,
+          'Content-Type': 'application/json'
+        },
+        timeout: 15000
+      }
+    );
+
+    const data = resp.data;
+    console.log('Resposta cancelamento:', JSON.stringify(data, null, 2));
+
+    if (data.Resultado) {
+      if (!data.Resultado.ok) {
+        const msgErro =
+          data.Resultado.resultado?.mensagemErro ||
+          data.Resultado.descricao ||
+          'Erro desconhecido ao cancelar.';
+        const codigo = data.Resultado.resultado?.codigo;
+        const erroFormatado = codigo ? `${codigo} - ${msgErro}` : msgErro;
+        throw new Error(erroFormatado);
+      }
+      return true;
+    }
+
+    if (data.message && data.message !== 'OK') {
+      throw new Error(data.message);
+    }
+
+    return true;
+  } catch (error) {
+    if (error.response) {
+      const status = error.response.status;
+      const data = error.response.data;
+      console.error('Erro da API ao cancelar (status ' + status + '):', JSON.stringify(data, null, 2));
+
+      let msg = '';
+
+      if (data?.Resultado) {
+        const msgErro =
+          data.Resultado.resultado?.mensagemErro ||
+          data.Resultado.descricao ||
+          'Erro desconhecido ao cancelar.';
+        const codigo = data.Resultado.resultado?.codigo;
+        msg = codigo ? `${codigo} - ${msgErro}` : msgErro;
+      } else if (data?.message) {
+        msg = data.message;
+      } else {
+        msg = 'Erro ao chamar API de cancelamento (status ' + status + ')';
+      }
+
+      throw new Error(msg);
+    } else {
+      throw new Error(error.message || 'Erro na comunicação com a API de cancelamento');
+    }
+  }
+}
+
 // -----------------------------------------
 // Monitorar EtapaSolicitacao (DevBase)
 // -----------------------------------------
-//
-// Status informados:
-// - aguardando motorista      -> Motorista aceitou e está indo pegar o cliente
-// - em viagem                 -> Motorista pegou o cliente e está indo ao destino
-// - cancelado pelo adiministrador
-// - cancelado pelo administrador
-// - cancelado pelo cliente
-// - cancelado pelo sistema
-// - cancelado pelo motorista
-// - excedeu tentativas        -> Não encontrou motorista
-// - viagem finalizada         -> Fim da corrida
-//
-// OBJETIVO: depois que criar a solicitação, ficar monitorando até
-// viagem finalizada / cancelamento / excedeu tentativas,
-// e avisar SEMPRE que o status mudar.
-//
-function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
-  const intervaloMs = 20000;     // 20s (respeita limite de 15s)
+function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, podeDuplicar = true) {
+  const intervaloMs = 20000;     // 20s
   const maxMinutos = 360;        // ~6 horas
   const maxTentativas = Math.ceil((maxMinutos * 60 * 1000) / intervaloMs);
 
@@ -407,7 +532,10 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
 
       const statusLower = StatusSolicitacao.toLowerCase();
 
-      // 0) Aviso genérico SEMPRE que o status mudar (exceto na primeira vez)
+      const origemTexto = dadosCorrida?.origem || 'não informada';
+      const destinoTexto = dadosCorrida?.destino || 'não informado';
+
+      // 0) Aviso genérico sempre que o status mudar (exceto na primeira vez)
       if (statusLower && statusLower !== lastStatusLower) {
         const especiais = [
           'aguardando motorista',
@@ -418,20 +546,24 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
           'cancelado pelo cliente',
           'cancelado pelo sistema',
           'cancelado pelo motorista',
-          'viagem finalizada'
+          'viagem finalizada',
+          'nenhum motorista disponível. por favor tente novamente.'
         ];
 
         if (!especiais.includes(statusLower)) {
           await enviarMensagemWhatsApp(
             whatsappFrom,
-            `🔄 Status atualizado da solicitação ${solicitacaoId}: ${StatusSolicitacao}`
+            `🔄 Status atualizado da solicitação ${solicitacaoId}:\n` +
+            `${StatusSolicitacao}\n\n` +
+            `Origem: ${origemTexto}\n` +
+            `Destino: ${destinoTexto}`
           );
         }
 
         lastStatusLower = statusLower;
       }
 
-      // 1) Motorista aceitou ("aguardando motorista" ou dados de motorista + Etapa>=2)
+      // 1) Motorista aceitou
       if (
         !hasDriver &&
         (
@@ -451,7 +583,9 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
             `Status: ${StatusSolicitacao}\n\n` +
             `Motorista: ${NomePrestador || 'não informado'}\n` +
             `Carro: ${Veiculo || 'não informado'}${Cor ? ' (' + Cor + ')' : ''}\n` +
-            `Placa: ${Placa || 'não informada'}`;
+            `Placa: ${Placa || 'não informada'}\n\n` +
+            `Origem: ${origemTexto}\n` +
+            `Destino: ${destinoTexto}`;
           await enviarMensagemWhatsApp(whatsappFrom, msg);
           sentDriverInfo = true;
         }
@@ -469,22 +603,70 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
       ) {
         const msg =
           `🚗 A viagem da solicitação ${solicitacaoId} está EM VIAGEM.\n` +
-          `O motorista já pegou o cliente e está indo ao destino.`;
+          `O motorista já pegou o cliente e está indo ao destino.\n\n` +
+          `Origem: ${origemTexto}\n` +
+          `Destino: ${destinoTexto}`;
         await enviarMensagemWhatsApp(whatsappFrom, msg);
         sentEmViagem = true;
         lastStatusLower = statusLower;
       }
 
-      // 3) Nenhum motorista encontrado ("excedeu tentativas")
-      if (!hasDriver && !sentNoDriver && statusLower === 'excedeu tentativas') {
-        const msg =
-          `⚠️ Nenhum motorista foi encontrado para a solicitação ${solicitacaoId}.\n` +
-          `Status: ${StatusSolicitacao}\n\n` +
-          `Verifique no painel se deseja reabrir ou criar uma nova corrida.`;
-        await enviarMensagemWhatsApp(whatsappFrom, msg);
-        sentNoDriver = true;
-        clearInterval(interval);
-        return;
+      // 3) Nenhum motorista encontrado
+      const isNoDriverStatus =
+        statusLower === 'excedeu tentativas' ||
+        statusLower.startsWith('nenhum motorista disponível');
+
+      if (!hasDriver && isNoDriverStatus) {
+        if (!sentNoDriver && podeDuplicar) {
+          // Primeira vez: tenta duplicar
+          const msgInicial =
+            `⚠️ Nenhum motorista foi encontrado para a solicitação ${solicitacaoId}.\n` +
+            `Status: ${StatusSolicitacao}\n\n` +
+            `Origem: ${origemTexto}\n` +
+            `Destino: ${destinoTexto}\n\n` +
+            `Vou tentar criar automaticamente uma nova solicitação para essa mesma corrida.`;
+          await enviarMensagemWhatsApp(whatsappFrom, msgInicial);
+
+          try {
+            const novoResultado = await criarSolicitacaoViagem(dadosCorrida);
+            const novaSolicitacaoId = novoResultado.solicitacaoId;
+
+            await enviarMensagemWhatsApp(
+              whatsappFrom,
+              `🔁 Nova solicitação criada automaticamente: ${novaSolicitacaoId}\n\n` +
+              `Origem: ${origemTexto}\n` +
+              `Destino: ${destinoTexto}\n\n` +
+              `Vou te avisar se algum motorista aceitar ou se, novamente, não houver motoristas disponíveis.`
+            );
+
+            // Passa a monitorar a nova solicitação (sem duplicar de novo)
+            startMonitoringSolicitacao(novaSolicitacaoId, whatsappFrom, dadosCorrida, false);
+          } catch (erroReplica) {
+            await enviarMensagemWhatsApp(
+              whatsappFrom,
+              `⚠️ Tentei criar uma nova solicitação automaticamente, mas deu erro:\n${erroReplica.message}\n\n` +
+              `Verifique no painel se deseja criar manualmente.`
+            );
+          }
+
+          sentNoDriver = true;
+          clearInterval(interval);
+          return;
+        }
+
+        if (!sentNoDriver && !podeDuplicar) {
+          // Segunda tentativa: não duplica mais
+          const msg =
+            `⚠️ Nenhum motorista foi encontrado novamente para a solicitação ${solicitacaoId}.\n` +
+            `Status: ${StatusSolicitacao}\n\n` +
+            `Origem: ${origemTexto}\n` +
+            `Destino: ${destinoTexto}\n\n` +
+            `Verifique no painel se deseja tentar mais uma vez ou encaminhar de outra forma.`;
+          await enviarMensagemWhatsApp(whatsappFrom, msg);
+          sentNoDriver = true;
+          clearInterval(interval);
+          return;
+        }
       }
 
       // 4) Motorista cancelou depois de aceitar
@@ -496,7 +678,9 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
         const msg =
           `⚠️ O motorista cancelou a corrida após ter aceitado.\n` +
           `Solicitação: ${solicitacaoId}\n` +
-          `Status: ${StatusSolicitacao}`;
+          `Status: ${StatusSolicitacao}\n\n` +
+          `Origem: ${origemTexto}\n` +
+          `Destino: ${destinoTexto}`;
         await enviarMensagemWhatsApp(whatsappFrom, msg);
         sentDriverCanceled = true;
         clearInterval(interval);
@@ -515,7 +699,9 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
       ) {
         const msg =
           `ℹ️ Solicitação ${solicitacaoId} foi cancelada.\n` +
-          `Motivo: ${StatusSolicitacao}`;
+          `Motivo: ${StatusSolicitacao}\n\n` +
+          `Origem: ${origemTexto}\n` +
+          `Destino: ${destinoTexto}`;
         await enviarMensagemWhatsApp(whatsappFrom, msg);
         sentDriverCanceled = true;
         clearInterval(interval);
@@ -529,6 +715,8 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
           const msg =
             `⏱ Atenção: a viagem da solicitação ${solicitacaoId} está em andamento há mais de 30 minutos desde que o motorista aceitou.\n` +
             `Status atual: ${StatusSolicitacao || 'indisponível'}\n\n` +
+            `Origem: ${origemTexto}\n` +
+            `Destino: ${destinoTexto}\n\n` +
             `Verifique no painel se está tudo bem com o motorista e o cliente.`;
           await enviarMensagemWhatsApp(whatsappFrom, msg);
           sentTooLong = true;
@@ -539,7 +727,9 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
       if (!sentFinalizada && (ViagemFinalizada || statusLower === 'viagem finalizada')) {
         const msg =
           `✅ Viagem da solicitação ${solicitacaoId} foi finalizada.\n` +
-          `Status final: ${StatusSolicitacao || 'viagem finalizada'}`;
+          `Status final: ${StatusSolicitacao || 'viagem finalizada'}\n\n` +
+          `Origem: ${origemTexto}\n` +
+          `Destino: ${destinoTexto}`;
         await enviarMensagemWhatsApp(whatsappFrom, msg);
         sentFinalizada = true;
         clearInterval(interval);
@@ -559,7 +749,10 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
       );
       await enviarMensagemWhatsApp(
         whatsappFrom,
-        `ℹ️ Encerrado o monitoramento automático da solicitação ${solicitacaoId} após aproximadamente ${maxMinutos} minutos.\nVerifique o painel para mais detalhes.`
+        `ℹ️ Encerrado o monitoramento automático da solicitação ${solicitacaoId} após aproximadamente ${maxMinutos} minutos.\n` +
+        `Origem: ${dadosCorrida?.origem || 'não informada'}\n` +
+        `Destino: ${dadosCorrida?.destino || 'não informado'}\n\n` +
+        `Verifique o painel para mais detalhes.`
       );
       clearInterval(interval);
     }
@@ -585,9 +778,8 @@ app.post('/webhook', async (req, res) => {
       if (messages && messages[0]) {
         const msg = messages[0];
         const from = msg.from;
-        const text = msg.text && msg.text.body ? msg.text.body : '';
 
-        console.log('Mensagem recebida de', from, ':', text);
+        console.log('Mensagem recebida bruta de', from, ':', JSON.stringify(msg, null, 2));
 
         // BLOQUEIO DE NÚMERO NÃO AUTORIZADO
         if (from !== NUMERO_AUTORIZADO) {
@@ -597,6 +789,48 @@ app.post('/webhook', async (req, res) => {
           );
           return res.sendStatus(200);
         }
+
+        // Tratamento de clique em botão (interactive)
+        if (msg.type === 'interactive' && msg.interactive && msg.interactive.button_reply) {
+          const buttonReply = msg.interactive.button_reply;
+          const buttonId = buttonReply.id;
+          const buttonTitle = buttonReply.title;
+
+          console.log('Botão clicado:', buttonId, '-', buttonTitle);
+
+          if (buttonId && buttonId.startsWith('cancel_')) {
+            // Aqui garantimos que o cancelamento é SEMPRE daquela solicitação específica
+            const solicitacaoId = buttonId.replace('cancel_', '');
+
+            try {
+              await enviarMensagemWhatsApp(
+                from,
+                `⏳ Enviando pedido de cancelamento da solicitação ${solicitacaoId} na plataforma...`
+              );
+
+              // tipo = "C" (cancelamento pelo cliente)
+              await cancelarSolicitacao(solicitacaoId, 'C', false, false);
+
+              await enviarMensagemWhatsApp(
+                from,
+                `✅ Solicitação ${solicitacaoId} cancelada com sucesso na plataforma.`
+              );
+            } catch (erroCanc) {
+              await enviarMensagemWhatsApp(
+                from,
+                `⚠️ Não consegui cancelar a solicitação ${solicitacaoId} pela API.\n` +
+                `Motivo: ${erroCanc.message || 'Erro desconhecido'}\n\n` +
+                `Se for urgente, verifique o cancelamento pelo painel da Move Driver.`
+              );
+            }
+          }
+
+          return res.sendStatus(200);
+        }
+
+        // Caso padrão: mensagem de texto
+        const text = msg.text && msg.text.body ? msg.text.body : '';
+        console.log('Mensagem de texto recebida de', from, ':', text);
 
         if (text.toLowerCase().startsWith('/corrida')) {
           const dados = parseCorrida(text);
@@ -624,19 +858,21 @@ app.post('/webhook', async (req, res) => {
                 textoValor = `\nValor fixo: R$ ${dados.valor.toFixed(2).replace('.', ',')}`;
               }
 
+              // Não precisa retornar nome do cliente nem forma de pagamento
               await enviarMensagemWhatsApp(
                 from,
                 `✅ Corrida criada com sucesso!\n` +
-                `Cliente: CENTRAL WHATSAPP\n` +
                 `ID da solicitação: ${solicitacaoId}\n` +
                 `Origem: ${dados.origem}\n` +
-                `Destino: ${dados.destino}\n` +
-                `Pagamento: Dinheiro${textoValor}\n\n` +
+                `Destino: ${dados.destino}${textoValor}\n\n` +
                 `Vou te avisar sempre que o status da solicitação mudar, até a viagem ser finalizada ou cancelada.`
               );
 
               if (solicitacaoId) {
-                startMonitoringSolicitacao(solicitacaoId, from);
+                // Envia mensagem com botão de cancelar (ligado só a esse ID)
+                await enviarMensagemWhatsAppComBotaoCancelar(from, solicitacaoId, dados);
+                // Inicia monitoramento dessa solicitação
+                startMonitoringSolicitacao(solicitacaoId, from, dados, true);
               }
             } catch (erroApi) {
               await enviarMensagemWhatsApp(
