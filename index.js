@@ -18,15 +18,14 @@ const MOVEDRIVER_API_URL = process.env.MOVEDRIVER_API_URL;
 const MOVEDRIVER_BASIC_AUTH = process.env.MOVEDRIVER_BASIC_AUTH;
 
 // Base da API externa (usada para EtapaSolicitacao)
-// Se não tiver env, usa a padrão da Move Driver
 const MOVEDRIVER_BASE_URL =
   process.env.MOVEDRIVER_BASE_URL ||
   'https://webapiexterna.azurewebsites.net/movedriver/api/external/';
 
 // IDs fixos reais da DevBase
-const CLIENTE_ID = 1;              // Cliente "CENTRAL WHATSAPP"
+const CLIENTE_ID = 1;               // Cliente "CENTRAL WHATSAPP"
 const SERVICO_ITEM_ID_VIAGEM = 250; // Serviço padrão de corrida
-const TIPO_PAGAMENTO_DINHEIRO = 5;  // TipoPagamentoID aceito via integração
+const TIPO_PAGAMENTO_DINHEIRO = 5;  // TipoPagamentoID via integração
 
 // Dados padrão de cidade/estado/CEP
 const DEFAULT_CIDADE = 'Coromandel';
@@ -92,13 +91,9 @@ async function enviarMensagemWhatsApp(numero, texto) {
   }
 }
 
-// Parse simples do comando /corrida
-// Formato esperado:
-//
-// /corrida
-// Origem: Rua X, 123 - Centro
-// Destino: Supermercado ABC
-// Obs: Alguma observação (opcional)
+// -------------------------
+// Parse do comando /corrida
+// -------------------------
 function parseCorrida(texto) {
   if (!texto) return null;
 
@@ -137,7 +132,9 @@ function parseCorrida(texto) {
   return dados;
 }
 
-// Chamar API externa para criar solicitação
+// -----------------------------
+// Criar solicitação na DevBase
+// -----------------------------
 async function criarSolicitacaoViagem(dadosCorrida) {
   if (!MOVEDRIVER_API_URL) {
     throw new Error('MOVEDRIVER_API_URL não configurada.');
@@ -236,14 +233,21 @@ async function criarSolicitacaoViagem(dadosCorrida) {
   }
 }
 
-// Monitorar EtapaSolicitacao para avisos:
-// - motorista aceitou (já temos)
-// - não encontrou motorista
-// - motorista cancelou depois de aceitar
-// - viagem demorou mais de 30min para finalizar
+// -----------------------------------------
+// Monitorar EtapaSolicitacao (DevBase)
+// -----------------------------------------
+// Usa seus status:
+// - aguardando motorista
+// - cancelado pelo adiministrador
+// - cancelado pelo cliente
+// - cancelado pelo sistema
+// - cancelado pelo motorista
+// - excedeu tentativas
+// - viagem finalizada
+
 function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
-  const intervaloMs = 20000; // 20s (respeita limite de 15s da DevBase)
-  const maxMinutos = 40;     // tempo máximo monitorando ~40min
+  const intervaloMs = 20000;     // 20s (respeita limite de 15s)
+  const maxMinutos = 40;         // monitorar ~40 minutos
   const maxTentativas = Math.ceil((maxMinutos * 60 * 1000) / intervaloMs);
 
   let tentativas = 0;
@@ -301,48 +305,39 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
         }
       }
 
-      // 2) Nenhum motorista encontrado (mensagem de status indicando isso)
-      if (
-        !hasDriver &&
-        !sentNoDriver &&
-        statusLower &&
-        (
-          statusLower.includes('sem motorista') ||
-          statusLower.includes('sem prestador') ||
-          statusLower.includes('não foi possível encontrar') ||
-          statusLower.includes('nao foi possivel encontrar')
-        )
-      ) {
+      // 2) Nenhum motorista encontrado
+      // Status específico: "excedeu tentativas"
+      if (!hasDriver && !sentNoDriver && statusLower === 'excedeu tentativas') {
         const msg =
           `⚠️ Nenhum motorista foi encontrado para a solicitação ${solicitacaoId}.\n` +
           `Status: ${StatusSolicitacao}\n\n` +
-          `Verifique no painel se deseja reabrir ou criar uma nova solicitação.`;
+          `Verifique no painel se deseja reabrir ou criar uma nova corrida.`;
         await enviarMensagemWhatsApp(whatsappFrom, msg);
         sentNoDriver = true;
         clearInterval(interval);
         return;
       }
 
-      // 2b) fallback: muito tempo sem motorista (ex: 15min) e ainda sem prestador
+      // 2b) fallback: muito tempo aguardando motorista
       const tempoTotalMs = tentativas * intervaloMs;
-      if (!hasDriver && !sentNoDriver && tempoTotalMs > 15 * 60 * 1000) {
+      if (!hasDriver && !sentNoDriver && statusLower === 'aguardando motorista' && tempoTotalMs > 15 * 60 * 1000) {
         const msg =
-          `⚠️ Atenção: já se passaram mais de 15 minutos e ainda não há motorista aceitando a solicitação ${solicitacaoId}.\n` +
-          `Status atual: ${StatusSolicitacao || 'indisponível'}\n\n` +
-          `Verifique no painel se está tudo certo ou se precisa abrir outra corrida.`;
+          `⚠️ Atenção: já se passaram mais de 15 minutos e a solicitação ${solicitacaoId} ainda está em "aguardando motorista".\n` +
+          `Verifique no painel se precisa abrir outra corrida.`;
         await enviarMensagemWhatsApp(whatsappFrom, msg);
         sentNoDriver = true;
-        // ainda deixamos monitorar por mais um tempo, caso alguém aceite depois
+        // ainda continua monitorando, caso um motorista aceite depois
       }
 
       // 3) Motorista cancelou depois de ter aceitado
+      // Status: "cancelado pelo motorista"
       if (
         hasDriver &&
         !sentDriverCanceled &&
-        statusLower.includes('cancelad')
+        statusLower === 'cancelado pelo motorista'
       ) {
         const msg =
-          `⚠️ O motorista cancelou a corrida.\n` +
+          `⚠️ O motorista cancelou a corrida após ter aceitado.\n` +
           `Solicitação: ${solicitacaoId}\n` +
           `Status: ${StatusSolicitacao}`;
         await enviarMensagemWhatsApp(whatsappFrom, msg);
@@ -351,17 +346,32 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
         return;
       }
 
-      // 4) Viagem demorando mais de 30min depois de aceita
+      // Outros cancelamentos (admin, cliente, sistema) – opcional,
+      // se quiser também pode avisar:
       if (
-        hasDriver &&
-        driverAcceptedAt &&
-        !sentTooLong &&
-        !ViagemFinalizada
+        !sentDriverCanceled &&
+        (
+          statusLower === 'cancelado pelo adiministrador' ||
+          statusLower === 'cancelado pelo administrador' || // corrigindo possível grafia
+          statusLower === 'cancelado pelo cliente' ||
+          statusLower === 'cancelado pelo sistema'
+        )
       ) {
+        const msg =
+          `ℹ️ Solicitação ${solicitacaoId} foi cancelada.\n` +
+          `Motivo: ${StatusSolicitacao}`;
+        await enviarMensagemWhatsApp(whatsappFrom, msg);
+        sentDriverCanceled = true;
+        clearInterval(interval);
+        return;
+      }
+
+      // 4) Viagem demorando mais de 30min após motorista aceitar
+      if (hasDriver && driverAcceptedAt && !sentTooLong && !ViagemFinalizada) {
         const elapsedMs = Date.now() - driverAcceptedAt;
         if (elapsedMs > 30 * 60 * 1000) {
           const msg =
-            `⏱ Atenção: a viagem da solicitação ${solicitacaoId} está em andamento há mais de 30 minutos.\n` +
+            `⏱ Atenção: a viagem da solicitação ${solicitacaoId} está em andamento há mais de 30 minutos desde que o motorista aceitou.\n` +
             `Status atual: ${StatusSolicitacao || 'indisponível'}\n\n` +
             `Verifique no painel se está tudo bem com o motorista e o cliente.`;
           await enviarMensagemWhatsApp(whatsappFrom, msg);
@@ -370,7 +380,7 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
       }
 
       // 5) Viagem finalizada
-      if (ViagemFinalizada && !sentFinalizada) {
+      if (ViagemFinalizada && !sentFinalizada && statusLower === 'viagem finalizada') {
         const msg =
           `✅ Viagem da solicitação ${solicitacaoId} foi finalizada.\n` +
           `Status final: ${StatusSolicitacao}`;
@@ -391,7 +401,7 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
       console.log(
         `Parando monitoramento da solicitação ${solicitacaoId} por tempo máximo.`
       );
-      await enviarMensagemWhatsApp(
+      enviarMensagemWhatsApp(
         whatsappFrom,
         `ℹ️ Encerrado o monitoramento automático da solicitação ${solicitacaoId} após aproximadamente ${maxMinutos} minutos.\nVerifique o painel para mais detalhes.`
       );
@@ -400,7 +410,9 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
   }, intervaloMs);
 }
 
-// POST /webhook - recebe mensagens do WhatsApp
+// -------------------------
+// WEBHOOK POST (WhatsApp)
+// -------------------------
 app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
@@ -437,7 +449,6 @@ app.post('/webhook', async (req, res) => {
               );
 
               const resultado = await criarSolicitacaoViagem(dados);
-
               const solicitacaoId = resultado.solicitacaoId;
 
               await enviarMensagemWhatsApp(
@@ -448,10 +459,9 @@ app.post('/webhook', async (req, res) => {
                 `Origem: ${dados.origem}\n` +
                 `Destino: ${dados.destino}\n` +
                 `Pagamento: Dinheiro\n\n` +
-                `Vou te avisar assim que um motorista aceitar ou se não for encontrado motorista.`
+                `Vou te avisar assim que um motorista aceitar, se não encontrar motorista, se for cancelada ou se passar de 30 minutos.`
               );
 
-              // Inicia monitoramento da EtapaSolicitacao para essa corrida
               if (solicitacaoId) {
                 startMonitoringSolicitacao(solicitacaoId, from);
               }
