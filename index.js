@@ -1,360 +1,485 @@
-const express = require("express");
-const axios = require("axios");
+const express = require('express');
+const bodyParser = require('body-parser');
+const axios = require('axios');
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-// =====================
-// CONFIGURAÇÕES GERAIS
-// =====================
+// Tokens / configs do WhatsApp
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'move_driver_bot';
 
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "move_driver_bot";
+// URL completa para criar solicitação (env no Render)
+// Ex: https://webapiexterna.azurewebsites.net/movedriver/api/external/CriarSolicitacaoViagem
+const MOVEDRIVER_API_URL = process.env.MOVEDRIVER_API_URL;
 
-// Token e Phone Number ID do WhatsApp
-const WABA_TOKEN =
-  process.env.WHATSAPP_TOKEN || process.env.WABA_TOKEN || "";
-const WABA_PHONE_NUMBER_ID =
-  process.env.WHATSAPP_PHONE_NUMBER_ID ||
-  process.env.WABA_PHONE_NUMBER_ID ||
-  "";
+// Auth da API externa Move Driver (env no Render)
+// Ex: Basic SEU_BASE64_DE_USUARIO:SENHA
+const MOVEDRIVER_BASIC_AUTH = process.env.MOVEDRIVER_BASIC_AUTH;
 
-// Config DevBase (Move Driver)
-const DEVBASE_BASE_URL =
-  process.env.DEVBASE_BASE_URL ||
-  "https://webapiexterna.azurewebsites.net/movedriver/api/external/";
-const DEVBASE_USER = process.env.DEVBASE_USER;
-const DEVBASE_PASSWORD = process.env.DEVBASE_PASSWORD;
+// Base da API externa (usada para EtapaSolicitacao)
+// Se não tiver env, usa a padrão da Move Driver
+const MOVEDRIVER_BASE_URL =
+  process.env.MOVEDRIVER_BASE_URL ||
+  'https://webapiexterna.azurewebsites.net/movedriver/api/external/';
 
-const DEVBASE_CLIENTE_ID = Number(process.env.DEVBASE_CLIENTE_ID || 1);
-const DEVBASE_SERVICO_ITEM_ID = Number(
-  process.env.DEVBASE_SERVICO_ITEM_ID || 250
-);
-const DEVBASE_TIPO_PAGAMENTO_ID = Number(
-  process.env.DEVBASE_TIPO_PAGAMENTO_ID || 5
-);
+// IDs fixos reais da DevBase
+const CLIENTE_ID = 1;              // Cliente "CENTRAL WHATSAPP"
+const SERVICO_ITEM_ID_VIAGEM = 250; // Serviço padrão de corrida
+const TIPO_PAGAMENTO_DINHEIRO = 5;  // TipoPagamentoID aceito via integração
 
-// Endereço padrão (caso não informe CEP/cidade/estado)
-const DEVBASE_CIDADE_PADRAO = process.env.DEVBASE_CIDADE_PADRAO || "Coromandel";
-const DEVBASE_ESTADO_SIGLA_PADRAO =
-  process.env.DEVBASE_ESTADO_SIGLA_PADRAO || "MG";
-const DEVBASE_CEP_PADRAO = process.env.DEVBASE_CEP_PADRAO || "38550000";
+// Dados padrão de cidade/estado/CEP
+const DEFAULT_CIDADE = 'Coromandel';
+const DEFAULT_UF = 'MG';
+const DEFAULT_CEP = '38550000';
 
-// =====================
-// HELPERS
-// =====================
+// Phone Number ID do WhatsApp (fixo, o seu)
+const PHONE_NUMBER_ID = '950609308124879';
 
-function getDevBaseAuthHeader() {
-  const token = Buffer.from(`${DEVBASE_USER}:${DEVBASE_PASSWORD}`).toString(
-    "base64"
-  );
-  return `Basic ${token}`;
-}
+console.log('VERIFY_TOKEN em uso:', VERIFY_TOKEN);
 
-async function sendWhatsAppText(to, body) {
-  if (!WABA_TOKEN || !WABA_PHONE_NUMBER_ID) {
-    console.error("WhatsApp TOKEN ou PHONE_NUMBER_ID não configurados.");
-    return;
+app.use(bodyParser.json());
+
+// Rota raiz
+app.get('/', (req, res) => {
+  res.send('🚕 Move Driver WhatsApp Bot conectado e funcionando (move-driver-bot1).');
+});
+
+// GET /webhook - verificação do Meta
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  } else {
+    return res.sendStatus(403);
   }
+});
 
+// Enviar mensagem pelo WhatsApp API
+async function enviarMensagemWhatsApp(numero, texto) {
   try {
+    const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
+
     await axios.post(
-      `https://graph.facebook.com/v21.0/${WABA_PHONE_NUMBER_ID}/messages`,
+      url,
       {
-        messaging_product: "whatsapp",
-        to,
-        type: "text",
-        text: { body },
+        messaging_product: 'whatsapp',
+        to: numero,
+        type: 'text',
+        text: {
+          body: texto
+        }
       },
       {
         headers: {
-          Authorization: `Bearer ${WABA_TOKEN}`,
-          "Content-Type": "application/json",
-        },
+          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+          'Content-Type': 'application/json'
+        }
       }
     );
-  } catch (err) {
-    console.error(
-      "Erro ao enviar mensagem WhatsApp:",
-      err.response?.data || err.message
-    );
+
+    console.log('Mensagem enviada para:', numero);
+  } catch (error) {
+    console.error('Erro ao enviar mensagem:');
+    if (error.response) {
+      console.error(JSON.stringify(error.response.data, null, 2));
+    } else {
+      console.error(error.message);
+    }
   }
 }
 
-// =====================
-// MONITORAR SOLICITAÇÃO
-// =====================
-// Fica consultando EtapaSolicitacao até aparecer motorista, carro e placa
-// Respeitando o limite da API: 1 requisição a cada 15s por SolicitacaoID
+// Parse simples do comando /corrida
+// Formato esperado:
+//
+// /corrida
+// Origem: Rua X, 123 - Centro
+// Destino: Supermercado ABC
+// Obs: Alguma observação (opcional)
+function parseCorrida(texto) {
+  if (!texto) return null;
 
-function startMonitoringSolicitacao(solicitacaoID, whatsappFrom) {
-  const intervaloMs = 20000; // 20s > 15s (limite da DevBase)
-  const maxTentativas = 60; // ~20 minutos (60 * 20s)
+  const linhas = texto
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  if (linhas.length === 0 || !linhas[0].toLowerCase().startsWith('/corrida')) {
+    return null;
+  }
+
+  const dados = {
+    origem: '',
+    destino: '',
+    observacoes: ''
+  };
+
+  for (let i = 1; i < linhas.length; i++) {
+    const linha = linhas[i];
+    const [chaveRaw, ...resto] = linha.split(':');
+    if (!resto.length) continue;
+
+    const valor = resto.join(':').trim();
+    const chave = chaveRaw.toLowerCase();
+
+    if (chave.includes('origem')) {
+      dados.origem = valor;
+    } else if (chave.includes('destino')) {
+      dados.destino = valor;
+    } else if (chave.startsWith('obs')) {
+      dados.observacoes = valor;
+    }
+  }
+
+  return dados;
+}
+
+// Chamar API externa para criar solicitação
+async function criarSolicitacaoViagem(dadosCorrida) {
+  if (!MOVEDRIVER_API_URL) {
+    throw new Error('MOVEDRIVER_API_URL não configurada.');
+  }
+  if (!MOVEDRIVER_BASIC_AUTH) {
+    throw new Error('MOVEDRIVER_BASIC_AUTH não configurada.');
+  }
+
+  const payload = {
+    ClienteID: CLIENTE_ID,
+    ServicoItemID: SERVICO_ITEM_ID_VIAGEM,
+    TipoPagamentoID: TIPO_PAGAMENTO_DINHEIRO,
+    enderecoOrigem: {
+      Endereco: dadosCorrida.origem,
+      CEP: DEFAULT_CEP,
+      Cidade: DEFAULT_CIDADE,
+      EstadoSigla: DEFAULT_UF,
+      Observacao: dadosCorrida.observacoes || ''
+    },
+    lstDestino: [
+      {
+        Endereco: dadosCorrida.destino,
+        CEP: DEFAULT_CEP,
+        Cidade: DEFAULT_CIDADE,
+        EstadoSigla: DEFAULT_UF,
+        Observacao: ''
+      }
+    ]
+  };
+
+  console.log('Enviando para API Move Driver:', JSON.stringify(payload, null, 2));
+
+  try {
+    const resp = await axios.post(MOVEDRIVER_API_URL, payload, {
+      headers: {
+        Authorization: MOVEDRIVER_BASIC_AUTH,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
+    });
+
+    const data = resp.data;
+    console.log('Resposta da API Move Driver:', JSON.stringify(data, null, 2));
+
+    if (data.Resultado) {
+      if (!data.Resultado.ok) {
+        const msgErro =
+          data.Resultado.resultado?.mensagemErro ||
+          data.Resultado.descricao ||
+          'Erro desconhecido';
+        const codigo = data.Resultado.resultado?.codigo;
+        const erroFormatado = codigo ? `${codigo} - ${msgErro}` : msgErro;
+        throw new Error(erroFormatado);
+      }
+
+      const resultado = data.Resultado.resultado || {};
+      return {
+        solicitacaoId: resultado.SolicitacaoID,
+        dataHoraCriacao: resultado.DataHoraCriacao
+      };
+    }
+
+    if (data.message) {
+      throw new Error(data.message);
+    }
+
+    return {
+      solicitacaoId: data.SolicitacaoID || 0,
+      dataHoraCriacao: data.DataHoraCriacao || null
+    };
+  } catch (error) {
+    if (error.response) {
+      const status = error.response.status;
+      const data = error.response.data;
+      console.error('Erro da API (status ' + status + '):', JSON.stringify(data, null, 2));
+
+      let msg = '';
+
+      if (data?.Resultado) {
+        const msgErro =
+          data.Resultado.resultado?.mensagemErro ||
+          data.Resultado.descricao ||
+          'Erro desconhecido';
+        const codigo = data.Resultado.resultado?.codigo;
+        msg = codigo ? `${codigo} - ${msgErro}` : msgErro;
+      } else if (data?.message) {
+        msg = data.message;
+      } else {
+        msg = 'Erro ao chamar API (status ' + status + ')';
+      }
+
+      throw new Error(msg);
+    } else {
+      throw new Error(error.message || 'Erro na comunicação com a API');
+    }
+  }
+}
+
+// Monitorar EtapaSolicitacao para avisos:
+// - motorista aceitou (já temos)
+// - não encontrou motorista
+// - motorista cancelou depois de aceitar
+// - viagem demorou mais de 30min para finalizar
+function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
+  const intervaloMs = 20000; // 20s (respeita limite de 15s da DevBase)
+  const maxMinutos = 40;     // tempo máximo monitorando ~40min
+  const maxTentativas = Math.ceil((maxMinutos * 60 * 1000) / intervaloMs);
 
   let tentativas = 0;
+  let hasDriver = false;
+  let driverAcceptedAt = null;
+  let sentDriverInfo = false;
+  let sentNoDriver = false;
+  let sentDriverCanceled = false;
+  let sentTooLong = false;
+  let sentFinalizada = false;
+
+  console.log(`Iniciando monitoramento da solicitação ${solicitacaoId} para ${whatsappFrom}`);
 
   const interval = setInterval(async () => {
     tentativas++;
 
     try {
-      const url = `${DEVBASE_BASE_URL}EtapaSolicitacao?solicitacaoID=${solicitacaoID}`;
+      const url = `${MOVEDRIVER_BASE_URL}EtapaSolicitacao?solicitacaoID=${solicitacaoId}`;
 
       const resp = await axios.get(url, {
         headers: {
-          Authorization: getDevBaseAuthHeader(),
+          Authorization: MOVEDRIVER_BASIC_AUTH
         },
+        timeout: 15000
       });
 
-      const etapa = resp.data?.EtapaSolicitacao;
+      const etapaObj = resp.data?.EtapaSolicitacao || resp.data || {};
+      console.log(`EtapaSolicitacao ${solicitacaoId}:`, JSON.stringify(etapaObj, null, 2));
 
-      if (!etapa) {
-        console.log(
-          `Solicitação ${solicitacaoID}: resposta sem EtapaSolicitacao`
-        );
-      } else {
-        console.log(`EtapaSolicitacao ${solicitacaoID}:`, etapa);
+      const Etapa = etapaObj.Etapa;
+      const StatusSolicitacao = etapaObj.StatusSolicitacao || '';
+      const NomePrestador = etapaObj.NomePrestador || '';
+      const Veiculo = etapaObj.Veiculo || '';
+      const Placa = etapaObj.Placa || '';
+      const Cor = etapaObj.Cor || '';
+      const ViagemFinalizada = !!etapaObj.ViagemFinalizada;
 
-        const {
-          Etapa,
-          StatusSolicitacao,
-          NomePrestador,
-          Veiculo,
-          Placa,
-          Cor,
-          ViagemFinalizada,
-        } = etapa;
+      const statusLower = StatusSolicitacao.toLowerCase();
 
-        // Quando o motorista ACEITA (Etapa 2, normalmente)
-        if (Etapa >= 2 && NomePrestador && Veiculo && Placa) {
+      // 1) Motorista aceitou (primeira vez)
+      if (!hasDriver && NomePrestador && Veiculo && Placa && Etapa >= 2) {
+        hasDriver = true;
+        driverAcceptedAt = Date.now();
+
+        if (!sentDriverInfo) {
           const msg =
             `✅ CORRIDA ACEITA\n\n` +
-            `Solicitação: ${solicitacaoID}\n` +
+            `Solicitação: ${solicitacaoId}\n` +
             `Status: ${StatusSolicitacao}\n\n` +
             `Motorista: ${NomePrestador}\n` +
-            `Carro: ${Veiculo} (${Cor || "cor não informada"})\n` +
+            `Carro: ${Veiculo}${Cor ? ' (' + Cor + ')' : ''}\n` +
             `Placa: ${Placa}`;
-
-          await sendWhatsAppText(whatsappFrom, msg);
-          clearInterval(interval);
-          return;
-        }
-
-        // Se a viagem finalizar sem nunca ter informado (caso raro)
-        if (ViagemFinalizada) {
-          const msg =
-            `⚠️ Viagem da solicitação ${solicitacaoID} foi finalizada.\n` +
-            `Status: ${StatusSolicitacao}`;
-          await sendWhatsAppText(whatsappFrom, msg);
-          clearInterval(interval);
-          return;
+          await enviarMensagemWhatsApp(whatsappFrom, msg);
+          sentDriverInfo = true;
         }
       }
+
+      // 2) Nenhum motorista encontrado (mensagem de status indicando isso)
+      if (
+        !hasDriver &&
+        !sentNoDriver &&
+        statusLower &&
+        (
+          statusLower.includes('sem motorista') ||
+          statusLower.includes('sem prestador') ||
+          statusLower.includes('não foi possível encontrar') ||
+          statusLower.includes('nao foi possivel encontrar')
+        )
+      ) {
+        const msg =
+          `⚠️ Nenhum motorista foi encontrado para a solicitação ${solicitacaoId}.\n` +
+          `Status: ${StatusSolicitacao}\n\n` +
+          `Verifique no painel se deseja reabrir ou criar uma nova solicitação.`;
+        await enviarMensagemWhatsApp(whatsappFrom, msg);
+        sentNoDriver = true;
+        clearInterval(interval);
+        return;
+      }
+
+      // 2b) fallback: muito tempo sem motorista (ex: 15min) e ainda sem prestador
+      const tempoTotalMs = tentativas * intervaloMs;
+      if (!hasDriver && !sentNoDriver && tempoTotalMs > 15 * 60 * 1000) {
+        const msg =
+          `⚠️ Atenção: já se passaram mais de 15 minutos e ainda não há motorista aceitando a solicitação ${solicitacaoId}.\n` +
+          `Status atual: ${StatusSolicitacao || 'indisponível'}\n\n` +
+          `Verifique no painel se está tudo certo ou se precisa abrir outra corrida.`;
+        await enviarMensagemWhatsApp(whatsappFrom, msg);
+        sentNoDriver = true;
+        // ainda deixamos monitorar por mais um tempo, caso alguém aceite depois
+      }
+
+      // 3) Motorista cancelou depois de ter aceitado
+      if (
+        hasDriver &&
+        !sentDriverCanceled &&
+        statusLower.includes('cancelad')
+      ) {
+        const msg =
+          `⚠️ O motorista cancelou a corrida.\n` +
+          `Solicitação: ${solicitacaoId}\n` +
+          `Status: ${StatusSolicitacao}`;
+        await enviarMensagemWhatsApp(whatsappFrom, msg);
+        sentDriverCanceled = true;
+        clearInterval(interval);
+        return;
+      }
+
+      // 4) Viagem demorando mais de 30min depois de aceita
+      if (
+        hasDriver &&
+        driverAcceptedAt &&
+        !sentTooLong &&
+        !ViagemFinalizada
+      ) {
+        const elapsedMs = Date.now() - driverAcceptedAt;
+        if (elapsedMs > 30 * 60 * 1000) {
+          const msg =
+            `⏱ Atenção: a viagem da solicitação ${solicitacaoId} está em andamento há mais de 30 minutos.\n` +
+            `Status atual: ${StatusSolicitacao || 'indisponível'}\n\n` +
+            `Verifique no painel se está tudo bem com o motorista e o cliente.`;
+          await enviarMensagemWhatsApp(whatsappFrom, msg);
+          sentTooLong = true;
+        }
+      }
+
+      // 5) Viagem finalizada
+      if (ViagemFinalizada && !sentFinalizada) {
+        const msg =
+          `✅ Viagem da solicitação ${solicitacaoId} foi finalizada.\n` +
+          `Status final: ${StatusSolicitacao}`;
+        await enviarMensagemWhatsApp(whatsappFrom, msg);
+        sentFinalizada = true;
+        clearInterval(interval);
+        return;
+      }
+
     } catch (err) {
       console.error(
-        `Erro ao consultar EtapaSolicitacao ${solicitacaoID}:`,
+        `Erro ao consultar EtapaSolicitacao ${solicitacaoId}:`,
         err.response?.data || err.message
       );
-      // Se der erro repetidamente, o loop vai parar por maxTentativas
     }
 
     if (tentativas >= maxTentativas) {
       console.log(
-        `Parando monitoramento da solicitação ${solicitacaoID} por tempo máximo.`
+        `Parando monitoramento da solicitação ${solicitacaoId} por tempo máximo.`
+      );
+      await enviarMensagemWhatsApp(
+        whatsappFrom,
+        `ℹ️ Encerrado o monitoramento automático da solicitação ${solicitacaoId} após aproximadamente ${maxMinutos} minutos.\nVerifique o painel para mais detalhes.`
       );
       clearInterval(interval);
     }
   }, intervaloMs);
 }
 
-// =====================
-// PARSER DA MENSAGEM /CORRIDA
-// =====================
-
-function parseCorridaMessage(text) {
-  // Remove /corrida da primeira linha
-  const linhas = text.split("\n").map((l) => l.trim()).filter((l) => l);
-
-  // Ex: ["/corrida", "origem: ...", "destino: ...", "obs: ..."]
-  let origem = "";
-  let destino = "";
-  let obs = "";
-
-  for (const linha of linhas) {
-    const lower = linha.toLowerCase();
-
-    if (lower.startsWith("/corrida")) continue;
-
-    if (lower.startsWith("origem:")) {
-      origem = linha.substring(linha.indexOf(":") + 1).trim();
-    } else if (lower.startsWith("destino:")) {
-      destino = linha.substring(linha.indexOf(":") + 1).trim();
-    } else if (lower.startsWith("obs:")) {
-      obs = linha.substring(linha.indexOf(":") + 1).trim();
-    }
-  }
-
-  if (!origem || !destino) {
-    return null;
-  }
-
-  return { origem, destino, obs };
-}
-
-// =====================
-// CRIAR SOLICITAÇÃO DEVBASE
-// =====================
-
-async function criarSolicitacaoViagem({ origem, destino, obs }) {
-  const url = `${DEVBASE_BASE_URL}CriarSolicitacaoViagem`;
-
-  const payload = {
-    ClienteID: DEVBASE_CLIENTE_ID,
-    ServicoItemID: DEVBASE_SERVICO_ITEM_ID,
-    TipoPagamentoID: DEVBASE_TIPO_PAGAMENTO_ID,
-    enderecoOrigem: {
-      CEP: DEVBASE_CEP_PADRAO,
-      Endereco: origem,
-      Cidade: DEVBASE_CIDADE_PADRAO,
-      EstadoSigla: DEVBASE_ESTADO_SIGLA_PADRAO,
-      Observacao: obs || "CENTRAL WHATSAPP",
-    },
-    lstDestino: [
-      {
-        CEP: DEVBASE_CEP_PADRAO,
-        Endereco: destino,
-        Cidade: DEVBASE_CIDADE_PADRAO,
-        EstadoSigla: DEVBASE_ESTADO_SIGLA_PADRAO,
-        Observacao: obs || "",
-      },
-    ],
-  };
-
-  const resp = await axios.post(url, payload, {
-    headers: {
-      Authorization: getDevBaseAuthHeader(),
-      "Content-Type": "application/json",
-    },
-  });
-
-  return resp.data;
-}
-
-// =====================
-// WEBHOOK - VERIFICAÇÃO (GET)
-// =====================
-
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode && token && mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("WEBHOOK VERIFICADO COM SUCESSO");
-    return res.status(200).send(challenge);
-  }
-
-  console.log("FALHA NA VERIFICAÇÃO DO WEBHOOK");
-  return res.sendStatus(403);
-});
-
-// =====================
-// WEBHOOK - MENSAGENS (POST)
-// =====================
-
-app.post("/webhook", async (req, res) => {
+// POST /webhook - recebe mensagens do WhatsApp
+app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
 
-    if (
-      body.object === "whatsapp_business_account" &&
-      body.entry &&
-      body.entry[0]?.changes &&
-      body.entry[0].changes[0]?.value?.messages &&
-      body.entry[0].changes[0].value.messages[0]
-    ) {
-      const message = body.entry[0].changes[0].value.messages[0];
-      const from = message.from; // número de quem mandou (atendente)
-      const msgBody = message.text?.body?.trim() || "";
+    console.log('POST /webhook recebido:');
+    console.log(JSON.stringify(body, null, 2));
 
-      console.log("Mensagem recebida:", from, msgBody);
+    if (body.object === 'whatsapp_business_account') {
+      const entry = body.entry && body.entry[0];
+      const changes = entry && entry.changes && entry.changes[0];
+      const value = changes && changes.value;
+      const messages = value && value.messages;
 
-      // Comando /corrida
-      if (msgBody.toLowerCase().startsWith("/corrida")) {
-        const dados = parseCorridaMessage(msgBody);
+      if (messages && messages[0]) {
+        const msg = messages[0];
+        const from = msg.from;
+        const text = msg.text && msg.text.body ? msg.text.body : '';
 
-        if (!dados) {
-          await sendWhatsAppText(
-            from,
-            "❌ Formato inválido.\n\nUse assim:\n/corrida\norigem: Rua tal, 123\ndestino: Outra rua, 456\nobs: opcional"
-          );
-        } else {
-          try {
-            await sendWhatsAppText(
+        console.log('Mensagem recebida de', from, ':', text);
+
+        if (text.toLowerCase().startsWith('/corrida')) {
+          const dados = parseCorrida(text);
+
+          if (!dados || !dados.origem || !dados.destino) {
+            await enviarMensagemWhatsApp(
               from,
-              "⏳ Criando solicitação de corrida na plataforma..."
+              '❌ Faltam dados.\n\nUse o modelo:\n/corrida\nOrigem: Rua tal, 123\nDestino: Outra rua, 456\nObs: (opcional)'
             );
-
-            const resultado = await criarSolicitacaoViagem(dados);
-
-            const ok = resultado?.Resultado?.ok;
-            const descricao = resultado?.Resultado?.descricao;
-            const solicitacaoID =
-              resultado?.Resultado?.resultado?.SolicitacaoID;
-
-            if (ok && solicitacaoID) {
-              await sendWhatsAppText(
+          } else {
+            try {
+              await enviarMensagemWhatsApp(
                 from,
-                `✅ Corrida criada com sucesso!\nSolicitaçãoID: ${solicitacaoID}\n\nOrigem: ${dados.origem}\nDestino: ${dados.destino}\n\nVou te avisar assim que um motorista aceitar.`
+                '⏳ Criando solicitação de corrida na plataforma...'
               );
 
-              // 👉 COMEÇA A MONITORAR ESSA SOLICITAÇÃO
-              startMonitoringSolicitacao(solicitacaoID, from);
-            } else {
-              const codigo = resultado?.Resultado?.resultado?.codigo;
-              const mensagemErro =
-                resultado?.Resultado?.resultado?.mensagemErro;
+              const resultado = await criarSolicitacaoViagem(dados);
 
-              await sendWhatsAppText(
+              const solicitacaoId = resultado.solicitacaoId;
+
+              await enviarMensagemWhatsApp(
                 from,
-                `❌ Não consegui criar a corrida.\nMotivo: ${descricao || ""}\n` +
-                  (codigo || mensagemErro
-                    ? `Código: ${codigo || ""}\nErro: ${
-                        mensagemErro || ""
-                      }`
-                    : "")
+                `✅ Corrida criada com sucesso!\n` +
+                `Cliente: CENTRAL WHATSAPP\n` +
+                `ID da solicitação: ${solicitacaoId}\n` +
+                `Origem: ${dados.origem}\n` +
+                `Destino: ${dados.destino}\n` +
+                `Pagamento: Dinheiro\n\n` +
+                `Vou te avisar assim que um motorista aceitar ou se não for encontrado motorista.`
+              );
+
+              // Inicia monitoramento da EtapaSolicitacao para essa corrida
+              if (solicitacaoId) {
+                startMonitoringSolicitacao(solicitacaoId, from);
+              }
+            } catch (erroApi) {
+              await enviarMensagemWhatsApp(
+                from,
+                `⚠️ Não consegui criar a corrida.\nMotivo: ${erroApi.message}`
               );
             }
-          } catch (err) {
-            console.error(
-              "Erro ao criar corrida:",
-              err.response?.data || err.message
-            );
-            await sendWhatsAppText(
-              from,
-              "❌ Erro ao criar a corrida na plataforma. Veja o log do servidor para mais detalhes."
-            );
           }
+        } else {
+          await enviarMensagemWhatsApp(
+            from,
+            '🚕 *Move Driver Bot Online*\n\n' +
+            'Para lançar uma corrida, use o comando:\n/corrida\n' +
+            'Origem: ...\nDestino: ...\nObs: ... (opcional)'
+          );
         }
-      } else {
-        // Qualquer outra mensagem que não seja /corrida
-        await sendWhatsAppText(
-          from,
-          "👋 Olá! Para abrir uma corrida pela central, envie no formato:\n\n/corrida\norigem: Rua tal, 123\ndestino: Outra rua, 456\nobs: opcional"
-        );
       }
     }
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("Erro geral no webhook:", err);
+    console.error('Erro no webhook:', err);
     res.sendStatus(500);
   }
 });
 
-// =====================
-// SUBIR SERVIDOR
-// =====================
-
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("Servidor WhatsApp bot rodando na porta " + PORT);
+  console.log(`Servidor rodando na porta ${PORT}`);
 });
