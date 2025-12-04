@@ -14,11 +14,13 @@ const MOVEDRIVER_API_URL = process.env.MOVEDRIVER_API_URL;       // ex: https://
 const MOVEDRIVER_BASIC_AUTH = process.env.MOVEDRIVER_BASIC_AUTH; // ex: Basic SEU_BASE64
 
 // IDs fixos (IDs reais da DevBase)
-const CLIENTE_ID = 3;              // Cliente "CENTRAL WHATSAPP"
-const SERVICO_ITEM_ID_VIAGEM = 5;  // ID do tipo de serviço (corrida normal)
+// Cliente padrão: CENTRAL WHATSAPP
+const CLIENTE_ID = 1;
 
-// 🔥 CORRETO AGORA:
-// TipoPagamentoID aceito via integração = 5
+// Serviço padrão de corrida (informado por você)
+const SERVICO_ITEM_ID_VIAGEM = 250;
+
+// TipoPagamentoID aceito via integração (informado: 5)
 const TIPO_PAGAMENTO_DINHEIRO = 5;
 
 // Dados padrão de cidade/estado/CEP
@@ -83,6 +85,12 @@ async function enviarMensagemWhatsApp(numero, texto) {
 }
 
 // Parse simples do comando /corrida
+// Formato esperado:
+//
+// /corrida
+// Origem: Rua X, 123 - Centro
+// Destino: Supermercado ABC
+// Obs: Alguma observação (opcional)
 function parseCorrida(texto) {
   if (!texto) return null;
 
@@ -133,7 +141,7 @@ async function criarSolicitacaoViagem(dadosCorrida) {
   const payload = {
     ClienteID: CLIENTE_ID,
     ServicoItemID: SERVICO_ITEM_ID_VIAGEM,
-    TipoPagamentoID: TIPO_PAGAMENTO_DINHEIRO,  // ✔ agora correto (5)
+    TipoPagamentoID: TIPO_PAGAMENTO_DINHEIRO,
     enderecoOrigem: {
       Endereco: dadosCorrida.origem,
       CEP: DEFAULT_CEP,
