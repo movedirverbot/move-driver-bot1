@@ -19,6 +19,8 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
 
   let lastStatusLower = ''; // para detectar mudança de status
 
+  const createdAtMs = Date.now(); // usado para medir tempo até o aceite
+
   console.log(`Iniciando monitoramento da solicitação ${solicitacaoId} para ${whatsappFrom}`);
 
   const interval = setInterval(async () => {
@@ -108,6 +110,14 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
         hasDriver = true;
         if (!driverAcceptedAt) {
           driverAcceptedAt = Date.now();
+
+          // mede quanto tempo demorou para aceitar
+          const diffMin = (driverAcceptedAt - createdAtMs) / 60000;
+          if (diffMin > DEMANDA_CONFIG.slowAcceptMinutes) {
+            await registerSlowAcceptDemanda(whatsappFrom);
+          } else {
+            await registerOkDriverDemanda();
+          }
         }
 
         if (!sentDriverInfo) {
@@ -131,13 +141,11 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
           sentDriverInfo = true;
         }
 
-        // 🧠 AQUI entra a lógica que você pediu:
-        // Se esse motorista já tiver OUTRA corrida "em viagem" (que o bot conhece),
-        // avisa que essa será a próxima corrida dele.
+        // Se esse motorista já tiver outra corrida EM VIAGEM monitorada pelo bot,
+        // avisa que essa será a próxima
         if (NomePrestador) {
           const ativos = driverActiveTrips.get(NomePrestador);
           if (ativos && ativos.size > 0) {
-            // Procura alguma outra solicitação diferente desta
             const outras = [...ativos].filter(id => id !== solicitacaoIdStr);
             if (outras.length > 0) {
               const outraId = outras[0];
@@ -162,7 +170,6 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
         hasDriver &&
         !sentEmViagem
       ) {
-        // Marca essa solicitação como viagem ativa desse motorista
         if (NomePrestador) {
           addDriverActiveTrip(NomePrestador, solicitacaoId);
         }
@@ -221,7 +228,7 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
         }
 
         if (!sentNoDriver && !podeDuplicar) {
-          // Segunda tentativa: não duplica mais
+          // Segunda tentativa: não duplica mais -> conta como evento de ALTA DEMANDA
           const msg =
             `⚠️ Nenhum motorista foi encontrado novamente para a solicitação ${solicitacaoId}.\n` +
             `Status: ${StatusSolicitacao}\n\n` +
@@ -229,7 +236,10 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
             `Destino: ${destinoTexto}\n\n` +
             `Verifique no painel se deseja tentar mais uma vez ou encaminhar de outra forma.`;
           await enviarMensagemWhatsApp(whatsappFrom, msg);
+
           sentNoDriver = true;
+          await registerNoDriverDemanda(whatsappFrom);
+
           clearInterval(interval);
           return;
         }
@@ -278,7 +288,6 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom, dadosCorrida, p
       }
 
       // 5) Viagem demorando mais de 30 min após aceite
-      // (só avisa se NÃO tiver sido cancelada / sem motorista / finalizada)
       if (
         hasDriver &&
         driverAcceptedAt &&
