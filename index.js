@@ -1,298 +1,360 @@
-const express = require('express');
-const bodyParser = require('body-parser');
-const axios = require('axios');
+const express = require("express");
+const axios = require("axios");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(express.json());
 
-// Tokens / configs do WhatsApp
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'move_driver_bot';
+// =====================
+// CONFIGURAÇÕES GERAIS
+// =====================
 
-// Config da API externa Move Driver (via Render)
-const MOVEDRIVER_API_URL = process.env.MOVEDRIVER_API_URL;       // ex: https://webapiexterna.azurewebsites.net/movedriver/api/external/CriarSolicitacaoViagem
-const MOVEDRIVER_BASIC_AUTH = process.env.MOVEDRIVER_BASIC_AUTH; // ex: Basic SEU_BASE64
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "move_driver_bot";
 
-// IDs fixos (IDs reais da DevBase)
-// Cliente padrão: CENTRAL WHATSAPP
-const CLIENTE_ID = 1;
+// Token e Phone Number ID do WhatsApp
+const WABA_TOKEN =
+  process.env.WHATSAPP_TOKEN || process.env.WABA_TOKEN || "";
+const WABA_PHONE_NUMBER_ID =
+  process.env.WHATSAPP_PHONE_NUMBER_ID ||
+  process.env.WABA_PHONE_NUMBER_ID ||
+  "";
 
-// Serviço padrão de corrida (informado por você)
-const SERVICO_ITEM_ID_VIAGEM = 250;
+// Config DevBase (Move Driver)
+const DEVBASE_BASE_URL =
+  process.env.DEVBASE_BASE_URL ||
+  "https://webapiexterna.azurewebsites.net/movedriver/api/external/";
+const DEVBASE_USER = process.env.DEVBASE_USER;
+const DEVBASE_PASSWORD = process.env.DEVBASE_PASSWORD;
 
-// TipoPagamentoID aceito via integração (informado: 5)
-const TIPO_PAGAMENTO_DINHEIRO = 5;
+const DEVBASE_CLIENTE_ID = Number(process.env.DEVBASE_CLIENTE_ID || 1);
+const DEVBASE_SERVICO_ITEM_ID = Number(
+  process.env.DEVBASE_SERVICO_ITEM_ID || 250
+);
+const DEVBASE_TIPO_PAGAMENTO_ID = Number(
+  process.env.DEVBASE_TIPO_PAGAMENTO_ID || 5
+);
 
-// Dados padrão de cidade/estado/CEP
-const DEFAULT_CIDADE = 'Coromandel';
-const DEFAULT_UF = 'MG';
-const DEFAULT_CEP = '38550000';
+// Endereço padrão (caso não informe CEP/cidade/estado)
+const DEVBASE_CIDADE_PADRAO = process.env.DEVBASE_CIDADE_PADRAO || "Coromandel";
+const DEVBASE_ESTADO_SIGLA_PADRAO =
+  process.env.DEVBASE_ESTADO_SIGLA_PADRAO || "MG";
+const DEVBASE_CEP_PADRAO = process.env.DEVBASE_CEP_PADRAO || "38550000";
 
-console.log('VERIFY_TOKEN em uso:', VERIFY_TOKEN);
+// =====================
+// HELPERS
+// =====================
 
-app.use(bodyParser.json());
+function getDevBaseAuthHeader() {
+  const token = Buffer.from(`${DEVBASE_USER}:${DEVBASE_PASSWORD}`).toString(
+    "base64"
+  );
+  return `Basic ${token}`;
+}
 
-// Rota raiz
-app.get('/', (req, res) => {
-  res.send('🚕 Move Driver WhatsApp Bot conectado e funcionando (move-driver-bot1).');
-});
-
-// GET /webhook - verificação do Meta
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  } else {
-    return res.sendStatus(403);
+async function sendWhatsAppText(to, body) {
+  if (!WABA_TOKEN || !WABA_PHONE_NUMBER_ID) {
+    console.error("WhatsApp TOKEN ou PHONE_NUMBER_ID não configurados.");
+    return;
   }
-});
 
-// Enviar mensagem pelo WhatsApp API
-async function enviarMensagemWhatsApp(numero, texto) {
   try {
-    const url = 'https://graph.facebook.com/v20.0/950609308124879/messages';
-
     await axios.post(
-      url,
+      `https://graph.facebook.com/v21.0/${WABA_PHONE_NUMBER_ID}/messages`,
       {
-        messaging_product: 'whatsapp',
-        to: numero,
-        type: 'text',
-        text: {
-          body: texto
-        }
+        messaging_product: "whatsapp",
+        to,
+        type: "text",
+        text: { body },
       },
       {
         headers: {
-          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-          'Content-Type': 'application/json'
-        }
+          Authorization: `Bearer ${WABA_TOKEN}`,
+          "Content-Type": "application/json",
+        },
       }
     );
-
-    console.log('Mensagem enviada para:', numero);
-  } catch (error) {
-    console.error('Erro ao enviar mensagem:');
-    if (error.response) {
-      console.error(JSON.stringify(error.response.data, null, 2));
-    } else {
-      console.error(error.message);
-    }
+  } catch (err) {
+    console.error(
+      "Erro ao enviar mensagem WhatsApp:",
+      err.response?.data || err.message
+    );
   }
 }
 
-// Parse simples do comando /corrida
-// Formato esperado:
-//
-// /corrida
-// Origem: Rua X, 123 - Centro
-// Destino: Supermercado ABC
-// Obs: Alguma observação (opcional)
-function parseCorrida(texto) {
-  if (!texto) return null;
+// =====================
+// MONITORAR SOLICITAÇÃO
+// =====================
+// Fica consultando EtapaSolicitacao até aparecer motorista, carro e placa
+// Respeitando o limite da API: 1 requisição a cada 15s por SolicitacaoID
 
-  const linhas = texto
-    .split('\n')
-    .map(l => l.trim())
-    .filter(Boolean);
+function startMonitoringSolicitacao(solicitacaoID, whatsappFrom) {
+  const intervaloMs = 20000; // 20s > 15s (limite da DevBase)
+  const maxTentativas = 60; // ~20 minutos (60 * 20s)
 
-  if (linhas.length === 0 || !linhas[0].toLowerCase().startsWith('/corrida')) {
+  let tentativas = 0;
+
+  const interval = setInterval(async () => {
+    tentativas++;
+
+    try {
+      const url = `${DEVBASE_BASE_URL}EtapaSolicitacao?solicitacaoID=${solicitacaoID}`;
+
+      const resp = await axios.get(url, {
+        headers: {
+          Authorization: getDevBaseAuthHeader(),
+        },
+      });
+
+      const etapa = resp.data?.EtapaSolicitacao;
+
+      if (!etapa) {
+        console.log(
+          `Solicitação ${solicitacaoID}: resposta sem EtapaSolicitacao`
+        );
+      } else {
+        console.log(`EtapaSolicitacao ${solicitacaoID}:`, etapa);
+
+        const {
+          Etapa,
+          StatusSolicitacao,
+          NomePrestador,
+          Veiculo,
+          Placa,
+          Cor,
+          ViagemFinalizada,
+        } = etapa;
+
+        // Quando o motorista ACEITA (Etapa 2, normalmente)
+        if (Etapa >= 2 && NomePrestador && Veiculo && Placa) {
+          const msg =
+            `✅ CORRIDA ACEITA\n\n` +
+            `Solicitação: ${solicitacaoID}\n` +
+            `Status: ${StatusSolicitacao}\n\n` +
+            `Motorista: ${NomePrestador}\n` +
+            `Carro: ${Veiculo} (${Cor || "cor não informada"})\n` +
+            `Placa: ${Placa}`;
+
+          await sendWhatsAppText(whatsappFrom, msg);
+          clearInterval(interval);
+          return;
+        }
+
+        // Se a viagem finalizar sem nunca ter informado (caso raro)
+        if (ViagemFinalizada) {
+          const msg =
+            `⚠️ Viagem da solicitação ${solicitacaoID} foi finalizada.\n` +
+            `Status: ${StatusSolicitacao}`;
+          await sendWhatsAppText(whatsappFrom, msg);
+          clearInterval(interval);
+          return;
+        }
+      }
+    } catch (err) {
+      console.error(
+        `Erro ao consultar EtapaSolicitacao ${solicitacaoID}:`,
+        err.response?.data || err.message
+      );
+      // Se der erro repetidamente, o loop vai parar por maxTentativas
+    }
+
+    if (tentativas >= maxTentativas) {
+      console.log(
+        `Parando monitoramento da solicitação ${solicitacaoID} por tempo máximo.`
+      );
+      clearInterval(interval);
+    }
+  }, intervaloMs);
+}
+
+// =====================
+// PARSER DA MENSAGEM /CORRIDA
+// =====================
+
+function parseCorridaMessage(text) {
+  // Remove /corrida da primeira linha
+  const linhas = text.split("\n").map((l) => l.trim()).filter((l) => l);
+
+  // Ex: ["/corrida", "origem: ...", "destino: ...", "obs: ..."]
+  let origem = "";
+  let destino = "";
+  let obs = "";
+
+  for (const linha of linhas) {
+    const lower = linha.toLowerCase();
+
+    if (lower.startsWith("/corrida")) continue;
+
+    if (lower.startsWith("origem:")) {
+      origem = linha.substring(linha.indexOf(":") + 1).trim();
+    } else if (lower.startsWith("destino:")) {
+      destino = linha.substring(linha.indexOf(":") + 1).trim();
+    } else if (lower.startsWith("obs:")) {
+      obs = linha.substring(linha.indexOf(":") + 1).trim();
+    }
+  }
+
+  if (!origem || !destino) {
     return null;
   }
 
-  const dados = {
-    origem: '',
-    destino: '',
-    observacoes: ''
-  };
-
-  for (let i = 1; i < linhas.length; i++) {
-    const linha = linhas[i];
-    const [chaveRaw, ...resto] = linha.split(':');
-    if (!resto.length) continue;
-
-    const valor = resto.join(':').trim();
-    const chave = chaveRaw.toLowerCase();
-
-    if (chave.includes('origem')) {
-      dados.origem = valor;
-    } else if (chave.includes('destino')) {
-      dados.destino = valor;
-    } else if (chave.startsWith('obs')) {
-      dados.observacoes = valor;
-    }
-  }
-
-  return dados;
+  return { origem, destino, obs };
 }
 
-// Chamar API externa para criar solicitação
-async function criarSolicitacaoViagem(dadosCorrida) {
-  if (!MOVEDRIVER_API_URL) {
-    throw new Error('MOVEDRIVER_API_URL não configurada.');
-  }
-  if (!MOVEDRIVER_BASIC_AUTH) {
-    throw new Error('MOVEDRIVER_BASIC_AUTH não configurada.');
-  }
+// =====================
+// CRIAR SOLICITAÇÃO DEVBASE
+// =====================
+
+async function criarSolicitacaoViagem({ origem, destino, obs }) {
+  const url = `${DEVBASE_BASE_URL}CriarSolicitacaoViagem`;
 
   const payload = {
-    ClienteID: CLIENTE_ID,
-    ServicoItemID: SERVICO_ITEM_ID_VIAGEM,
-    TipoPagamentoID: TIPO_PAGAMENTO_DINHEIRO,
+    ClienteID: DEVBASE_CLIENTE_ID,
+    ServicoItemID: DEVBASE_SERVICO_ITEM_ID,
+    TipoPagamentoID: DEVBASE_TIPO_PAGAMENTO_ID,
     enderecoOrigem: {
-      Endereco: dadosCorrida.origem,
-      CEP: DEFAULT_CEP,
-      Cidade: DEFAULT_CIDADE,
-      EstadoSigla: DEFAULT_UF,
-      Observacao: dadosCorrida.observacoes || ''
+      CEP: DEVBASE_CEP_PADRAO,
+      Endereco: origem,
+      Cidade: DEVBASE_CIDADE_PADRAO,
+      EstadoSigla: DEVBASE_ESTADO_SIGLA_PADRAO,
+      Observacao: obs || "CENTRAL WHATSAPP",
     },
     lstDestino: [
       {
-        Endereco: dadosCorrida.destino,
-        CEP: DEFAULT_CEP,
-        Cidade: DEFAULT_CIDADE,
-        EstadoSigla: DEFAULT_UF,
-        Observacao: ''
-      }
-    ]
+        CEP: DEVBASE_CEP_PADRAO,
+        Endereco: destino,
+        Cidade: DEVBASE_CIDADE_PADRAO,
+        EstadoSigla: DEVBASE_ESTADO_SIGLA_PADRAO,
+        Observacao: obs || "",
+      },
+    ],
   };
 
-  console.log('Enviando para API Move Driver:', JSON.stringify(payload, null, 2));
+  const resp = await axios.post(url, payload, {
+    headers: {
+      Authorization: getDevBaseAuthHeader(),
+      "Content-Type": "application/json",
+    },
+  });
 
-  try {
-    const resp = await axios.post(MOVEDRIVER_API_URL, payload, {
-      headers: {
-        Authorization: MOVEDRIVER_BASIC_AUTH,
-        'Content-Type': 'application/json'
-      },
-      timeout: 15000
-    });
-
-    const data = resp.data;
-    console.log('Resposta da API Move Driver:', JSON.stringify(data, null, 2));
-
-    if (data.Resultado) {
-      if (!data.Resultado.ok) {
-        const msgErro =
-          data.Resultado.resultado?.mensagemErro ||
-          data.Resultado.descricao ||
-          'Erro desconhecido';
-        const codigo = data.Resultado.resultado?.codigo;
-        const erroFormatado = codigo ? `${codigo} - ${msgErro}` : msgErro;
-        throw new Error(erroFormatado);
-      }
-
-      const resultado = data.Resultado.resultado || {};
-      return {
-        solicitacaoId: resultado.SolicitacaoID,
-        dataHoraCriacao: resultado.DataHoraCriacao
-      };
-    }
-
-    if (data.message) {
-      throw new Error(data.message);
-    }
-
-    return {
-      solicitacaoId: data.SolicitacaoID || 0,
-      dataHoraCriacao: data.DataHoraCriacao || null
-    };
-  } catch (error) {
-    if (error.response) {
-      const status = error.response.status;
-      const data = error.response.data;
-      console.error('Erro da API (status ' + status + '):', JSON.stringify(data, null, 2));
-
-      let msg = '';
-
-      if (data?.Resultado) {
-        const msgErro =
-          data.Resultado.resultado?.mensagemErro ||
-          data.Resultado.descricao ||
-          'Erro desconhecido';
-        const codigo = data.Resultado.resultado?.codigo;
-        msg = codigo ? `${codigo} - ${msgErro}` : msgErro;
-      } else if (data?.message) {
-        msg = data.message;
-      } else {
-        msg = 'Erro ao chamar API (status ' + status + ')';
-      }
-
-      throw new Error(msg);
-    } else {
-      throw new Error(error.message || 'Erro na comunicação com a API');
-    }
-  }
+  return resp.data;
 }
 
-// POST /webhook - recebe mensagens do WhatsApp
-app.post('/webhook', async (req, res) => {
+// =====================
+// WEBHOOK - VERIFICAÇÃO (GET)
+// =====================
+
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode && token && mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("WEBHOOK VERIFICADO COM SUCESSO");
+    return res.status(200).send(challenge);
+  }
+
+  console.log("FALHA NA VERIFICAÇÃO DO WEBHOOK");
+  return res.sendStatus(403);
+});
+
+// =====================
+// WEBHOOK - MENSAGENS (POST)
+// =====================
+
+app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
 
-    console.log('POST /webhook recebido:');
-    console.log(JSON.stringify(body, null, 2));
+    if (
+      body.object === "whatsapp_business_account" &&
+      body.entry &&
+      body.entry[0]?.changes &&
+      body.entry[0].changes[0]?.value?.messages &&
+      body.entry[0].changes[0].value.messages[0]
+    ) {
+      const message = body.entry[0].changes[0].value.messages[0];
+      const from = message.from; // número de quem mandou (atendente)
+      const msgBody = message.text?.body?.trim() || "";
 
-    if (body.object === 'whatsapp_business_account') {
-      const entry = body.entry && body.entry[0];
-      const changes = entry && entry.changes && entry.changes[0];
-      const value = changes && changes.value;
-      const messages = value && value.messages;
+      console.log("Mensagem recebida:", from, msgBody);
 
-      if (messages && messages[0]) {
-        const msg = messages[0];
-        const from = msg.from;
-        const text = msg.text && msg.text.body ? msg.text.body : '';
+      // Comando /corrida
+      if (msgBody.toLowerCase().startsWith("/corrida")) {
+        const dados = parseCorridaMessage(msgBody);
 
-        console.log('Mensagem recebida de', from, ':', text);
-
-        if (text.toLowerCase().startsWith('/corrida')) {
-          const dados = parseCorrida(text);
-
-          if (!dados || !dados.origem || !dados.destino) {
-            await enviarMensagemWhatsApp(
+        if (!dados) {
+          await sendWhatsAppText(
+            from,
+            "❌ Formato inválido.\n\nUse assim:\n/corrida\norigem: Rua tal, 123\ndestino: Outra rua, 456\nobs: opcional"
+          );
+        } else {
+          try {
+            await sendWhatsAppText(
               from,
-              '❌ Faltam dados.\n\nUse o modelo:\n/corrida\nOrigem: ...\nDestino: ...\nObs: (opcional)'
+              "⏳ Criando solicitação de corrida na plataforma..."
             );
-          } else {
-            try {
-              const resultado = await criarSolicitacaoViagem(dados);
 
-              await enviarMensagemWhatsApp(
+            const resultado = await criarSolicitacaoViagem(dados);
+
+            const ok = resultado?.Resultado?.ok;
+            const descricao = resultado?.Resultado?.descricao;
+            const solicitacaoID =
+              resultado?.Resultado?.resultado?.SolicitacaoID;
+
+            if (ok && solicitacaoID) {
+              await sendWhatsAppText(
                 from,
-                `✅ Corrida criada com sucesso!\n` +
-                `Cliente: CENTRAL WHATSAPP\n` +
-                `ID da solicitação: ${resultado.solicitacaoId}\n` +
-                `Origem: ${dados.origem}\n` +
-                `Destino: ${dados.destino}\n` +
-                `Pagamento: Dinheiro`
+                `✅ Corrida criada com sucesso!\nSolicitaçãoID: ${solicitacaoID}\n\nOrigem: ${dados.origem}\nDestino: ${dados.destino}\n\nVou te avisar assim que um motorista aceitar.`
               );
-            } catch (erroApi) {
-              await enviarMensagemWhatsApp(
+
+              // 👉 COMEÇA A MONITORAR ESSA SOLICITAÇÃO
+              startMonitoringSolicitacao(solicitacaoID, from);
+            } else {
+              const codigo = resultado?.Resultado?.resultado?.codigo;
+              const mensagemErro =
+                resultado?.Resultado?.resultado?.mensagemErro;
+
+              await sendWhatsAppText(
                 from,
-                `⚠️ Não consegui criar a corrida.\nMotivo: ${erroApi.message}`
+                `❌ Não consegui criar a corrida.\nMotivo: ${descricao || ""}\n` +
+                  (codigo || mensagemErro
+                    ? `Código: ${codigo || ""}\nErro: ${
+                        mensagemErro || ""
+                      }`
+                    : "")
               );
             }
+          } catch (err) {
+            console.error(
+              "Erro ao criar corrida:",
+              err.response?.data || err.message
+            );
+            await sendWhatsAppText(
+              from,
+              "❌ Erro ao criar a corrida na plataforma. Veja o log do servidor para mais detalhes."
+            );
           }
-        } else {
-          await enviarMensagemWhatsApp(
-            from,
-            '🚕 *Move Driver Bot Online*\n\nUse:\n/corrida\nOrigem: ...\nDestino: ...\nObs: ...'
-          );
         }
+      } else {
+        // Qualquer outra mensagem que não seja /corrida
+        await sendWhatsAppText(
+          from,
+          "👋 Olá! Para abrir uma corrida pela central, envie no formato:\n\n/corrida\norigem: Rua tal, 123\ndestino: Outra rua, 456\nobs: opcional"
+        );
       }
     }
 
     res.sendStatus(200);
   } catch (err) {
-    console.error('Erro no webhook:', err);
+    console.error("Erro geral no webhook:", err);
     res.sendStatus(500);
   }
 });
 
+// =====================
+// SUBIR SERVIDOR
+// =====================
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
+  console.log("Servidor WhatsApp bot rodando na porta " + PORT);
 });
