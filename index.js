@@ -483,6 +483,17 @@ app.post('/webhook', async (req, res) => {
         const msg = messages[0];
         const from = msg.from;
         const text = msg.text && msg.text.body ? msg.text.body : '';
+        // ---------------------------------------
+// BLOQUEIO DE NÚMERO NÃO AUTORIZADO
+// ---------------------------------------
+const numeroAutorizado = "5534992606729"; 
+// Formato WhatsApp = 55 + DDD + número
+
+if (from !== numeroAutorizado) {
+  await enviarMensagemWhatsApp(from, "⚠️ Este número não está autorizado a usar este serviço.");
+  return res.sendStatus(200);
+}
+
 
         console.log('Mensagem recebida de', from, ':', text);
 
