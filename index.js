@@ -513,81 +513,6 @@ async function cancelarSolicitacao(
   }
 }
 
-// -----------------------------
-// Detector de ALTA DEMANDA
-// -----------------------------
-const DEMANDA_CONFIG = {
-  noDriverConsecutiveThreshold: 2,          // 2 corridas seguidas sem motorista
-  slowAcceptMinutes: 3,                     // > 3 minutos para considerar "aceite lento"
-  slowAcceptWindowMs: 15 * 60 * 1000,       // olha os últimos 15 minutos
-  slowAcceptCountThreshold: 3,              // 3 aceitações lentas na janela disparam alerta
-  minAlertIntervalMs: 10 * 60 * 1000        // mínimo 10 minutos entre alertas
-};
-
-const demandaState = {
-  consecNoDriver: 0,        // corridas seguidas sem motorista
-  slowAcceptEvents: [],     // timestamps de aceitações lentas
-  lastAlertAt: 0            // última vez que mandou alerta (ms)
-};
-
-function pruneOldSlowAcceptEvents() {
-  const cutoff = Date.now() - DEMANDA_CONFIG.slowAcceptWindowMs;
-  demandaState.slowAcceptEvents = demandaState.slowAcceptEvents.filter(ts => ts >= cutoff);
-}
-
-async function maybeSendDemandaAlert(whatsappFrom) {
-  const now = Date.now();
-  if (now - demandaState.lastAlertAt < DEMANDA_CONFIG.minAlertIntervalMs) {
-    return; // evita spam
-  }
-
-  pruneOldSlowAcceptEvents();
-
-  const temMuitasSemMotorista =
-    demandaState.consecNoDriver >= DEMANDA_CONFIG.noDriverConsecutiveThreshold;
-
-  const temMuitosAceitesLentos =
-    demandaState.slowAcceptEvents.length >= DEMANDA_CONFIG.slowAcceptCountThreshold;
-
-  if (!temMuitasSemMotorista && !temMuitosAceitesLentos) {
-    return;
-  }
-
-  let msg = '🚨 *ALTA DEMANDA DETECTADA*\n\n';
-
-  if (temMuitasSemMotorista) {
-    msg +=
-      `• Foram detectadas ${demandaState.consecNoDriver} corridas seguidas sem motorista disponível.\n`;
-  }
-
-  if (temMuitosAceitesLentos) {
-    msg +=
-      `• Várias corridas recentes demoraram mais de ${DEMANDA_CONFIG.slowAcceptMinutes} minutos para encontrar motorista.\n`;
-  }
-
-  msg +=
-    `\nSugestão: verifique o painel e, se necessário, chame mais motoristas para entrar online.`;
-
-  await enviarMensagemWhatsApp(whatsappFrom, msg);
-  demandaState.lastAlertAt = now;
-}
-
-async function registerNoDriverDemanda(whatsappFrom) {
-  demandaState.consecNoDriver += 1;
-  await maybeSendDemandaAlert(whatsappFrom);
-}
-
-async function registerOkDriverDemanda() {
-  // sempre que uma corrida tiver motorista, reseta a sequência de "sem motorista"
-  demandaState.consecNoDriver = 0;
-}
-
-async function registerSlowAcceptDemanda(whatsappFrom) {
-  demandaState.slowAcceptEvents.push(Date.now());
-  pruneOldSlowAcceptEvents();
-  await maybeSendDemandaAlert(whatsappFrom);
-}
-
 // -----------------------------------------
 // Monitorar EtapaSolicitacao (DevBase)
 // -----------------------------------------
@@ -613,8 +538,6 @@ function startMonitoringSolicitacao(
   let sentEmViagem = false;
 
   let lastStatusLower = ''; // para detectar mudança de status
-
-  const createdAtMs = Date.now(); // usado para medir tempo até o aceite
 
   console.log(`Iniciando monitoramento da solicitação ${solicitacaoId} para ${whatsappFrom}`);
 
@@ -705,14 +628,6 @@ function startMonitoringSolicitacao(
         hasDriver = true;
         if (!driverAcceptedAt) {
           driverAcceptedAt = Date.now();
-
-          // mede quanto tempo demorou para aceitar
-          const diffMin = (driverAcceptedAt - createdAtMs) / 60000;
-          if (diffMin > DEMANDA_CONFIG.slowAcceptMinutes) {
-            await registerSlowAcceptDemanda(whatsappFrom);
-          } else {
-            await registerOkDriverDemanda();
-          }
         }
 
         if (!sentDriverInfo) {
@@ -770,7 +685,7 @@ function startMonitoringSolicitacao(
         }
 
         const etaDestinoTexto = PrevisaoChegadaDestino
-          ? `Previsão de chegada ao destino: ${PrevisaoChegadaDestino}\n\n`
+          ? `Previsao de chegada ao destino: ${PrevisaoChegadaDestino}\n\n`
           : '';
 
         const msg =
@@ -823,7 +738,7 @@ function startMonitoringSolicitacao(
         }
 
         if (!sentNoDriver && !podeDuplicar) {
-          // Segunda tentativa: não duplica mais -> conta como evento de ALTA DEMANDA
+          // Segunda tentativa: não duplica mais
           const msg =
             `⚠️ Nenhum motorista foi encontrado novamente para a solicitação ${solicitacaoId}.\n` +
             `Status: ${StatusSolicitacao}\n\n` +
@@ -833,8 +748,6 @@ function startMonitoringSolicitacao(
           await enviarMensagemWhatsApp(whatsappFrom, msg);
 
           sentNoDriver = true;
-          await registerNoDriverDemanda(whatsappFrom);
-
           clearInterval(interval);
           return;
         }
