@@ -5,17 +5,17 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Token do WhatsApp (permanente) - vindo das variáveis de ambiente do Render
+// Token permanente do WhatsApp vindo das variáveis de ambiente do Render
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 
-// Verify token do webhook
+// Verify token do webhook (tem que ser igual ao do Meta)
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'move_driver_bot';
 
 console.log('VERIFY_TOKEN em uso:', VERIFY_TOKEN);
 
 app.use(bodyParser.json());
 
-// Rota raiz só pra testar no navegador
+// Rota raiz só pra teste
 app.get('/', (req, res) => {
   res.send('🚕 Move Driver WhatsApp Bot conectado e funcionando (move-driver-bot1).');
 });
@@ -36,8 +36,8 @@ app.get('/webhook', (req, res) => {
 // Função para enviar mensagem via WhatsApp Cloud API
 async function enviarMensagemWhatsApp(numero, texto) {
   try {
-    // Usa o seu PHONE_NUMBER_ID real
-    const url = "https://graph.facebook.com/v20.0/925476213978583/messages";
+    // Usa o SEU Phone Number ID real
+    const url = "https://graph.facebook.com/v20.0/950609308124879/messages";
 
     await axios.post(
       url,
@@ -77,29 +77,26 @@ app.post('/webhook', async (req, res) => {
     console.log('POST /webhook recebido:');
     console.log(JSON.stringify(body, null, 2));
 
-    // Confere se é evento de conta WhatsApp
     if (body.object === 'whatsapp_business_account') {
       const entry = body.entry && body.entry[0];
       const changes = entry && entry.changes && entry.changes[0];
       const value = changes && changes.value;
       const messages = value && value.messages;
 
-      // Só processa se realmente tiver mensagem (não status, etc)
       if (messages && messages[0]) {
         const msg = messages[0];
-        const from = msg.from; // número do cliente/atendente
+        const from = msg.from; // número de quem mandou
         const text = msg.text && msg.text.body ? msg.text.body : '';
 
         console.log('Mensagem recebida de', from, ':', text);
 
-        // Resposta simples por enquanto
+        // Por enquanto, uma resposta simples
         const resposta = '🚕 Bot da Move Driver está online! Em breve vou lançar corridas direto aqui 😉';
 
         await enviarMensagemWhatsApp(from, resposta);
       }
     }
 
-    // Sempre responde 200 pro Meta
     res.sendStatus(200);
 
   } catch (err) {
