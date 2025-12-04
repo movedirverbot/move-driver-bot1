@@ -9,15 +9,16 @@ const PORT = process.env.PORT || 3000;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'move_driver_bot';
 
-// Config da API externa Move Driver
-const MOVEDRIVER_API_URL = process.env.MOVEDRIVER_API_URL;
-const MOVEDRIVER_BASIC_AUTH = process.env.MOVEDRIVER_BASIC_AUTH;
+// Config da API externa Move Driver (via Render)
+const MOVEDRIVER_API_URL = process.env.MOVEDRIVER_API_URL;       // ex: https://webapiexterna.azurewebsites.net/movedriver/api/external/CriarSolicitacaoViagem
+const MOVEDRIVER_BASIC_AUTH = process.env.MOVEDRIVER_BASIC_AUTH; // ex: Basic SEU_BASE64
 
-// IDs fixos (ajuste depois se precisar)
+// IDs fixos (ajuste depois para os IDs reais da sua base DevBase, se necessário)
 const CLIENTE_ID = 3;              // ID do cliente "CENTRAL WHATSAPP" na DevBase
 const SERVICO_ITEM_ID_VIAGEM = 5;  // ID do tipo de serviço (corrida padrão)
 const TIPO_PAGAMENTO_DINHEIRO = 1; // ID da forma de pagamento em DINHEIRO
 
+// Dados padrão de cidade/estado/CEP
 const DEFAULT_CIDADE = 'Coromandel';
 const DEFAULT_UF = 'MG';
 const DEFAULT_CEP = '38550000';
@@ -47,7 +48,8 @@ app.get('/webhook', (req, res) => {
 // Enviar mensagem pelo WhatsApp API
 async function enviarMensagemWhatsApp(numero, texto) {
   try {
-    const url = 'https://graph.facebook.com/v20.0/950609308124879/messages'; // seu Phone Number ID
+    // Usa o SEU Phone Number ID real
+    const url = 'https://graph.facebook.com/v20.0/950609308124879/messages';
 
     await axios.post(
       url,
@@ -79,6 +81,12 @@ async function enviarMensagemWhatsApp(numero, texto) {
 }
 
 // Parse simples do comando /corrida
+// Formato esperado:
+//
+// /corrida
+// Origem: Rua X, 123 - Centro
+// Destino: Supermercado ABC
+// Obs: Alguma observação (opcional)
 function parseCorrida(texto) {
   if (!texto) return null;
 
@@ -150,35 +158,74 @@ async function criarSolicitacaoViagem(dadosCorrida) {
 
   console.log('Enviando para API Move Driver:', JSON.stringify(payload, null, 2));
 
-  const resp = await axios.post(MOVEDRIVER_API_URL, payload, {
-    headers: {
-      Authorization: MOVEDRIVER_BASIC_AUTH,
-      'Content-Type': 'application/json'
-    },
-    timeout: 15000
-  });
+  try {
+    const resp = await axios.post(MOVEDRIVER_API_URL, payload, {
+      headers: {
+        Authorization: MOVEDRIVER_BASIC_AUTH,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
+    });
 
-  const data = resp.data;
-  console.log('Resposta da API Move Driver:', JSON.stringify(data, null, 2));
+    const data = resp.data;
+    console.log('Resposta da API Move Driver:', JSON.stringify(data, null, 2));
 
-  if (!data.Resultado || !data.Resultado.ok) {
-    const msgErro =
-      data.Resultado?.resultado?.mensagemErro ||
-      data.Resultado?.descricao ||
-      'Erro desconhecido';
+    // Caso venha no formato com "Resultado"
+    if (data.Resultado) {
+      if (!data.Resultado.ok) {
+        const msgErro =
+          data.Resultado.resultado?.mensagemErro ||
+          data.Resultado.descricao ||
+          'Erro desconhecido';
+        const codigo = data.Resultado.resultado?.codigo;
+        const erroFormatado = codigo ? `${codigo} - ${msgErro}` : msgErro;
+        throw new Error(erroFormatado);
+      }
 
-    const codigo = data.Resultado?.resultado?.codigo;
-    const erroFormatado = codigo ? `${codigo} - ${msgErro}` : msgErro;
+      const resultado = data.Resultado.resultado || {};
+      return {
+        solicitacaoId: resultado.SolicitacaoID,
+        dataHoraCriacao: resultado.DataHoraCriacao
+      };
+    }
 
-    throw new Error(`Falha ao criar solicitação: ${erroFormatado}`);
+    // Caso venha só com "message"
+    if (data.message) {
+      throw new Error(data.message);
+    }
+
+    // Fallback genérico
+    return {
+      solicitacaoId: data.SolicitacaoID || 0,
+      dataHoraCriacao: data.DataHoraCriacao || null
+    };
+  } catch (error) {
+    if (error.response) {
+      const status = error.response.status;
+      const data = error.response.data;
+      console.error('Erro da API (status ' + status + '):', JSON.stringify(data, null, 2));
+
+      let msg = '';
+
+      if (data?.Resultado) {
+        const msgErro =
+          data.Resultado.resultado?.mensagemErro ||
+          data.Resultado.descricao ||
+          'Erro desconhecido';
+        const codigo = data.Resultado.resultado?.codigo;
+        msg = codigo ? `${codigo} - ${msgErro}` : msgErro;
+      } else if (data?.message) {
+        msg = data.message;
+      } else {
+        msg = 'Erro ao chamar API (status ' + status + ')';
+      }
+
+      throw new Error(msg);
+    } else {
+      console.error('Erro sem response da API:', error.message);
+      throw new Error(error.message || 'Erro na comunicação com a API');
+    }
   }
-
-  const resultado = data.Resultado.resultado;
-
-  return {
-    solicitacaoId: resultado.SolicitacaoID,
-    dataHoraCriacao: resultado.DataHoraCriacao
-  };
 }
 
 // POST /webhook - recebe mensagens do WhatsApp
