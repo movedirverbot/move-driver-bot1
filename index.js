@@ -486,7 +486,7 @@ app.post('/webhook', async (req, res) => {
         // ---------------------------------------
 // BLOQUEIO DE NÚMERO NÃO AUTORIZADO
 // ---------------------------------------
-const numeroAutorizado = "5534992606729"; 
+const numeroAutorizado = "553492606729"; 
 // Formato WhatsApp = 55 + DDD + número
 
 if (from !== numeroAutorizado) {
