@@ -5,22 +5,22 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// TOKEN DO META (para enviar mensagens)
+// Token do WhatsApp (permanente) - vindo das variáveis de ambiente do Render
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 
-// VERIFY TOKEN para o webhook
+// Verify token do webhook
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'move_driver_bot';
 
 console.log('VERIFY_TOKEN em uso:', VERIFY_TOKEN);
 
 app.use(bodyParser.json());
 
-// Rota raiz
+// Rota raiz só pra testar no navegador
 app.get('/', (req, res) => {
-  res.send('🚕 Move Driver WhatsApp Bot conectado e funcionando.');
+  res.send('🚕 Move Driver WhatsApp Bot conectado e funcionando (move-driver-bot1).');
 });
 
-// GET /webhook - Verificação do Meta
+// GET /webhook - verificação do Meta
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -33,10 +33,11 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// Função para enviar mensagem via WhatsApp API
+// Função para enviar mensagem via WhatsApp Cloud API
 async function enviarMensagemWhatsApp(numero, texto) {
   try {
-    const url = "https://graph.facebook.com/v20.0/PHONE_NUMBER_ID/messages";
+    // Usa o seu PHONE_NUMBER_ID real
+    const url = "https://graph.facebook.com/v20.0/925476213978583/messages";
 
     await axios.post(
       url,
@@ -44,7 +45,9 @@ async function enviarMensagemWhatsApp(numero, texto) {
         messaging_product: "whatsapp",
         to: numero,
         type: "text",
-        text: { body: texto }
+        text: {
+          body: texto
+        }
       },
       {
         headers: {
@@ -57,37 +60,55 @@ async function enviarMensagemWhatsApp(numero, texto) {
     console.log("Mensagem enviada para:", numero);
 
   } catch (error) {
-    console.error("Erro ao enviar mensagem:", error.response?.data || error);
+    console.error("Erro ao enviar mensagem:");
+    if (error.response) {
+      console.error(JSON.stringify(error.response.data, null, 2));
+    } else {
+      console.error(error.message);
+    }
   }
 }
 
-// POST /webhook - Recebe mensagens do WhatsApp
+// POST /webhook - recebe mensagens do WhatsApp
 app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
 
-    if (body.object === "whatsapp_business_account") {
-      const mensagem = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    console.log('POST /webhook recebido:');
+    console.log(JSON.stringify(body, null, 2));
 
-      if (mensagem) {
-        const numero = mensagem.from;
-        const texto = mensagem.text?.body || "";
+    // Confere se é evento de conta WhatsApp
+    if (body.object === 'whatsapp_business_account') {
+      const entry = body.entry && body.entry[0];
+      const changes = entry && entry.changes && entry.changes[0];
+      const value = changes && changes.value;
+      const messages = value && value.messages;
 
-        console.log("Mensagem recebida:", texto);
+      // Só processa se realmente tiver mensagem (não status, etc)
+      if (messages && messages[0]) {
+        const msg = messages[0];
+        const from = msg.from; // número do cliente/atendente
+        const text = msg.text && msg.text.body ? msg.text.body : '';
 
-        // Resposta automática
-        await enviarMensagemWhatsApp(numero, "🚕 Bot da Move Driver está online! Como posso ajudar?");
+        console.log('Mensagem recebida de', from, ':', text);
+
+        // Resposta simples por enquanto
+        const resposta = '🚕 Bot da Move Driver está online! Em breve vou lançar corridas direto aqui 😉';
+
+        await enviarMensagemWhatsApp(from, resposta);
       }
     }
 
+    // Sempre responde 200 pro Meta
     res.sendStatus(200);
 
   } catch (err) {
-    console.error("Erro no webhook:", err);
+    console.error('Erro no processamento do webhook:', err);
     res.sendStatus(500);
   }
 });
 
+// Sobe o servidor
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
