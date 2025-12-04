@@ -35,6 +35,10 @@ const DEFAULT_CEP = '38550000';
 // Phone Number ID do WhatsApp (o seu)
 const PHONE_NUMBER_ID = '950609308124879';
 
+// Número autorizado (seu WhatsApp) - formato enviado pela API
+// Seu número (34) 9 9260-6729 chega como 553492606729
+const NUMERO_AUTORIZADO = '553492606729';
+
 console.log('VERIFY_TOKEN em uso:', VERIFY_TOKEN);
 
 app.use(bodyParser.json());
@@ -94,22 +98,70 @@ async function enviarMensagemWhatsApp(numero, texto) {
 // -------------------------
 // Parse do comando /corrida
 // -------------------------
-function parseCorrida(texto) {
+
+// Novo parser simples com " x " e valor opcional
+function parseCorridaSimples(texto) {
   if (!texto) return null;
 
-  const linhas = texto
-    .split('\n')
-    .map(l => l.trim())
+  // Usa " x " como separador (origem x destino x obs ... x valor)
+  const partes = texto
+    .split(' x ')
+    .map(p => p.trim())
     .filter(Boolean);
 
-  if (linhas.length === 0 || !linhas[0].toLowerCase().startsWith('/corrida')) {
+  if (partes.length < 2) {
     return null;
   }
 
+  const origem = partes[0];
+  const destino = partes[1];
+
+  let observacoes = '';
+  let valor = null;
+
+  for (let i = 2; i < partes.length; i++) {
+    const p = partes[i];
+
+    // Obs: prefixo "obs:"
+    if (p.toLowerCase().startsWith('obs:')) {
+      observacoes = p.slice(4).trim();
+      continue;
+    }
+
+    // Tentativa de extrair valor numérico (R$ 30,00, 30,00, 25 etc.)
+    let raw = p.toLowerCase();
+    raw = raw.replace('r$', '').trim();
+    raw = raw.split('(')[0].trim();   // remove qualquer coisa depois de "("
+    raw = raw.split(' ')[0].trim();   // pega só o primeiro token
+
+    raw = raw.replace(/\./g, '');     // remove pontos de milhar
+    raw = raw.replace(',', '.');      // vírgula -> ponto
+
+    const num = parseFloat(raw);
+    if (!isNaN(num)) {
+      valor = num;
+    }
+  }
+
+  if (!origem || !destino) {
+    return null;
+  }
+
+  return {
+    origem,
+    destino,
+    observacoes,
+    valor
+  };
+}
+
+// Parser antigo (multi-linha com Origem:, Destino:, Obs:)
+function parseCorridaAntigo(linhas) {
   const dados = {
     origem: '',
     destino: '',
-    observacoes: ''
+    observacoes: '',
+    valor: null
   };
 
   for (let i = 1; i < linhas.length; i++) {
@@ -126,10 +178,62 @@ function parseCorrida(texto) {
       dados.destino = valor;
     } else if (chave.startsWith('obs')) {
       dados.observacoes = valor;
+    } else if (chave.includes('valor')) {
+      // Opcional: Valor: 30,00
+      let raw = valor.toLowerCase().replace('r$', '').trim();
+      raw = raw.replace(/\./g, '');
+      raw = raw.replace(',', '.');
+      const num = parseFloat(raw);
+      if (!isNaN(num)) {
+        dados.valor = num;
+      }
     }
   }
 
+  if (!dados.origem || !dados.destino) {
+    return null;
+  }
+
   return dados;
+}
+
+// Função principal de parse
+function parseCorrida(texto) {
+  if (!texto) return null;
+
+  const linhas = texto
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  if (linhas.length === 0) return null;
+
+  const primeiraLinha = linhas[0];
+
+  if (!primeiraLinha.toLowerCase().startsWith('/corrida')) {
+    return null;
+  }
+
+  // Remove o "/corrida" da primeira linha
+  let depoisDoComando = primeiraLinha.slice(8).trim(); // "/corrida".length === 8
+
+  // Monta uma string única com o resto do texto
+  let resto = '';
+  if (depoisDoComando) {
+    resto = depoisDoComando + ' ' + linhas.slice(1).join(' ');
+  } else {
+    resto = linhas.slice(1).join(' ');
+  }
+  resto = resto.trim();
+
+  // 1) Tenta o formato simples: origem x destino x obs: ... x valor
+  if (resto.includes(' x ')) {
+    const simples = parseCorridaSimples(resto);
+    if (simples) return simples;
+  }
+
+  // 2) Cai para o formato antigo com "Origem:", "Destino:", "Obs:"
+  return parseCorridaAntigo(linhas);
 }
 
 // -----------------------------
@@ -164,6 +268,11 @@ async function criarSolicitacaoViagem(dadosCorrida) {
       }
     ]
   };
+
+  // Se o usuário informou um valor fixo, enviamos o campo Valor
+  if (typeof dadosCorrida.valor === 'number' && !isNaN(dadosCorrida.valor)) {
+    payload.Valor = dadosCorrida.valor;
+  }
 
   console.log('Enviando para API Move Driver:', JSON.stringify(payload, null, 2));
 
@@ -254,7 +363,7 @@ async function criarSolicitacaoViagem(dadosCorrida) {
 //
 function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
   const intervaloMs = 20000;     // 20s (respeita limite de 15s)
-  const maxMinutos = 360;        // ~6 horas de monitoramento por segurança
+  const maxMinutos = 360;        // ~6 horas
   const maxTentativas = Math.ceil((maxMinutos * 60 * 1000) / intervaloMs);
 
   let tentativas = 0;
@@ -298,9 +407,8 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
 
       const statusLower = StatusSolicitacao.toLowerCase();
 
-      // 0) Aviso genérico SEMPRE que o status mudar (exceto na primeira vez sem status)
+      // 0) Aviso genérico SEMPRE que o status mudar (exceto na primeira vez)
       if (statusLower && statusLower !== lastStatusLower) {
-        // Não duplicar mensagem quando vamos mandar uma mensagem especial
         const especiais = [
           'aguardando motorista',
           'em viagem',
@@ -323,10 +431,7 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
         lastStatusLower = statusLower;
       }
 
-      // 1) Motorista aceitou
-      //
-      // Regra que você explicou:
-      // "aguardando motorista" = motorista já aceitou e está indo buscar
+      // 1) Motorista aceitou ("aguardando motorista" ou dados de motorista + Etapa>=2)
       if (
         !hasDriver &&
         (
@@ -351,13 +456,12 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
           sentDriverInfo = true;
         }
 
-        // Também consideramos isso como mudança de status relevante
         if (statusLower !== lastStatusLower) {
           lastStatusLower = statusLower;
         }
       }
 
-      // 2) Motorista está "em viagem" (já pegou o cliente)
+      // 2) "em viagem"
       if (
         statusLower === 'em viagem' &&
         hasDriver &&
@@ -371,8 +475,7 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
         lastStatusLower = statusLower;
       }
 
-      // 3) Nenhum motorista encontrado
-      // Somente quando o sistema marcar "excedeu tentativas"
+      // 3) Nenhum motorista encontrado ("excedeu tentativas")
       if (!hasDriver && !sentNoDriver && statusLower === 'excedeu tentativas') {
         const msg =
           `⚠️ Nenhum motorista foi encontrado para a solicitação ${solicitacaoId}.\n` +
@@ -384,7 +487,7 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
         return;
       }
 
-      // 4) Motorista cancelou depois de ter aceitado
+      // 4) Motorista cancelou depois de aceitar
       if (
         hasDriver &&
         !sentDriverCanceled &&
@@ -400,7 +503,7 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
         return;
       }
 
-      // Outros cancelamentos (admin, cliente, sistema) – também avisar
+      // Outros cancelamentos
       if (
         !sentDriverCanceled &&
         (
@@ -419,7 +522,7 @@ function startMonitoringSolicitacao(solicitacaoId, whatsappFrom) {
         return;
       }
 
-      // 5) Viagem demorando mais de 30min depois que o motorista aceitou
+      // 5) Viagem demorando mais de 30 min após aceite
       if (hasDriver && driverAcceptedAt && !sentTooLong && !ViagemFinalizada) {
         const elapsedMs = Date.now() - driverAcceptedAt;
         if (elapsedMs > 30 * 60 * 1000) {
@@ -483,19 +586,17 @@ app.post('/webhook', async (req, res) => {
         const msg = messages[0];
         const from = msg.from;
         const text = msg.text && msg.text.body ? msg.text.body : '';
-        // ---------------------------------------
-// BLOQUEIO DE NÚMERO NÃO AUTORIZADO
-// ---------------------------------------
-const numeroAutorizado = "553492606729"; 
-// Formato WhatsApp = 55 + DDD + número
-
-if (from !== numeroAutorizado) {
-  await enviarMensagemWhatsApp(from, "⚠️ Este número não está autorizado a usar este serviço.");
-  return res.sendStatus(200);
-}
-
 
         console.log('Mensagem recebida de', from, ':', text);
+
+        // BLOQUEIO DE NÚMERO NÃO AUTORIZADO
+        if (from !== NUMERO_AUTORIZADO) {
+          await enviarMensagemWhatsApp(
+            from,
+            '⚠️ Este número não está autorizado a usar este serviço.'
+          );
+          return res.sendStatus(200);
+        }
 
         if (text.toLowerCase().startsWith('/corrida')) {
           const dados = parseCorrida(text);
@@ -503,7 +604,10 @@ if (from !== numeroAutorizado) {
           if (!dados || !dados.origem || !dados.destino) {
             await enviarMensagemWhatsApp(
               from,
-              '❌ Faltam dados.\n\nUse o modelo:\n/corrida\nOrigem: Rua tal, 123\nDestino: Outra rua, 456\nObs: (opcional)'
+              '❌ Faltam dados.\n\nExemplos:\n\n' +
+              '/corrida\nRua A, 123 x Rua B, 456\n\n' +
+              'ou\n\n' +
+              '/corrida Rua A, 123 x Rua B, 456 x obs: cliente idoso x 30,00'
             );
           } else {
             try {
@@ -515,6 +619,11 @@ if (from !== numeroAutorizado) {
               const resultado = await criarSolicitacaoViagem(dados);
               const solicitacaoId = resultado.solicitacaoId;
 
+              let textoValor = '';
+              if (typeof dados.valor === 'number' && !isNaN(dados.valor)) {
+                textoValor = `\nValor fixo: R$ ${dados.valor.toFixed(2).replace('.', ',')}`;
+              }
+
               await enviarMensagemWhatsApp(
                 from,
                 `✅ Corrida criada com sucesso!\n` +
@@ -522,7 +631,7 @@ if (from !== numeroAutorizado) {
                 `ID da solicitação: ${solicitacaoId}\n` +
                 `Origem: ${dados.origem}\n` +
                 `Destino: ${dados.destino}\n` +
-                `Pagamento: Dinheiro\n\n` +
+                `Pagamento: Dinheiro${textoValor}\n\n` +
                 `Vou te avisar sempre que o status da solicitação mudar, até a viagem ser finalizada ou cancelada.`
               );
 
@@ -540,8 +649,9 @@ if (from !== numeroAutorizado) {
           await enviarMensagemWhatsApp(
             from,
             '🚕 *Move Driver Bot Online*\n\n' +
-            'Para lançar uma corrida, use o comando:\n/corrida\n' +
-            'Origem: ...\nDestino: ...\nObs: ... (opcional)'
+            'Para lançar uma corrida, use por exemplo:\n\n' +
+            '/corrida Rua A, 123 x Rua B, 456\n' +
+            '/corrida Rua A, 123 x Rua B, 456 x obs: teste x 30,00'
           );
         }
       }
